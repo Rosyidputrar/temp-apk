@@ -50,3 +50,5 @@ jobs:
           tag_name: b${{ github.run_number }}
           name: Build ${{ github.run_number }}
           files: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+permissions:
+  contents: write
