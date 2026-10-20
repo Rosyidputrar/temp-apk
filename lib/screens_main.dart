@@ -194,11 +194,15 @@ class _HomeScreenState extends State<HomeScreen> {
       await appState.setActive(ref, address);
       if (!mounted) return;
       setState(() => _lastCreated = r);
-      await copyText(context, address, 'Alamat aktif & disalin: $address');
       final ws = r is Map ? listOf(r['warnings']) : const [];
-      if (ws.isNotEmpty && mounted) {
-        showOk(context, 'Catatan: ${ws.join(' • ')}');
-      }
+      // Satu snackbar saja: catatan server tidak menimpa konfirmasi salin.
+      await copyText(
+        context,
+        address,
+        ws.isEmpty
+            ? 'Alamat aktif & disalin: $address'
+            : 'Alamat aktif & disalin: $address\nCatatan: ${ws.join(' • ')}',
+      );
     } catch (e) {
       if (mounted) showError(context, e);
     } finally {
@@ -765,7 +769,11 @@ class _InboxScreenState extends State<InboxScreen> {
                 ? DismissDirection.none
                 : DismissDirection.endToStart,
             confirmDismiss: (_) => _deleteOne(m),
-            onDismissed: (_) => setState(() => _msgs.remove(m)),
+            // Hapus menurut id: _msgs bisa sudah diganti auto-refresh saat
+            // dialog konfirmasi terbuka, jadi `remove(m)` tidak menemukannya.
+            onDismissed: (_) => setState(
+              () => _msgs.removeWhere((x) => x is Map && x['id'] == m['id']),
+            ),
             background: Container(
               color: s.errorContainer,
               alignment: Alignment.centerRight,
@@ -1023,6 +1031,10 @@ class _MessageDetailScreenState extends State<MessageDetailScreen> {
     }
   }
 
+  /// Teks body; jatuh ke preview bila kosong (seperti `m.text || m.preview`).
+  String _bodyText(Map m) =>
+      _str(m['text']).isNotEmpty ? m['text'].toString() : _str(m['preview']);
+
   List<String> _otps(Map m) {
     final out = <String>[];
     final all = m['otp_all'];
@@ -1152,7 +1164,7 @@ class _MessageDetailScreenState extends State<MessageDetailScreen> {
         const Text('Cuplikan', style: TextStyle(fontWeight: FontWeight.w700)),
         const SizedBox(height: 4),
         Text(
-          _str(m['text'] ?? m['preview'], '(tanpa isi)'),
+          _str(_bodyText(m), '(tanpa isi)'),
           maxLines: 6,
           overflow: TextOverflow.ellipsis,
         ),
@@ -1161,7 +1173,7 @@ class _MessageDetailScreenState extends State<MessageDetailScreen> {
   }
 
   Widget _textTab(Map m) {
-    final text = _str(m['text'] ?? m['preview'], '(Body teks kosong)');
+    final text = _str(_bodyText(m), '(Body teks kosong)');
     return Stack(
       children: [
         SingleChildScrollView(
@@ -1256,11 +1268,9 @@ class _HtmlTabState extends State<_HtmlTab> with AutomaticKeepAliveClientMixin {
     const head =
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         '<style>body{word-wrap:break-word}img{max-width:100%;height:auto}</style>';
-    if (RegExp(r'<head[^>]*>', caseSensitive: false).hasMatch(html)) {
-      return html.replaceFirstMapped(
-        RegExp(r'<head[^>]*>', caseSensitive: false),
-        (mm) => '${mm[0]}$head',
-      );
+    final headTag = RegExp(r'<head(\s[^>]*)?>', caseSensitive: false);
+    if (headTag.hasMatch(html)) {
+      return html.replaceFirstMapped(headTag, (mm) => '${mm[0]}$head');
     }
     return '<!doctype html><html><head>$head</head><body>$html</body></html>';
   }
@@ -1273,10 +1283,18 @@ class _HtmlTabState extends State<_HtmlTab> with AutomaticKeepAliveClientMixin {
         NavigationDelegate(
           onPageFinished: (_) => _ready = true,
           onNavigationRequest: (req) {
-            // Muatan awal boleh; klik link di email TIDAK dibuka di dalam
-            // aplikasi (hindari pelacak & halaman phishing) — disalin saja.
-            if (!_ready) return NavigationDecision.navigate;
-            if (mounted) copyText(context, req.url, 'Link disalin: ${req.url}');
+            // Klik link di email TIDAK dibuka di dalam aplikasi (hindari
+            // pelacak & phishing) — disalin saja. Yang boleh hanya muatan
+            // awal: dokumen HTML lokal, atau URL sumber mentah + redirect-nya
+            // sebelum halaman pertama selesai.
+            final u = req.url;
+            if (u.startsWith('about:') || u.startsWith('data:')) {
+              return NavigationDecision.navigate;
+            }
+            if (html == null && !_ready) return NavigationDecision.navigate;
+            if (req.isMainFrame && mounted) {
+              copyText(context, u, 'Link disalin: $u');
+            }
             return NavigationDecision.prevent;
           },
         ),

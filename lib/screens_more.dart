@@ -154,8 +154,9 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
         ],
       ),
     );
+    // Controller dialog sengaja tidak di-dispose di sini: showDialog selesai
+    // saat animasi tutup baru mulai dan TextField masih terpasang.
     final text = ctl.text;
-    ctl.dispose();
     if (ok != true || text.trim().isEmpty) return;
     try {
       final parsed = jsonDecode(text);
@@ -237,8 +238,6 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
       ),
     );
     final l = label.text.trim(), n = note.text.trim();
-    label.dispose();
-    note.dispose();
     if (save != true) return;
     try {
       await api.patchFavorite(addr, label: l, note: n);
@@ -487,6 +486,7 @@ class _VariantsScreenState extends State<VariantsScreen> {
   final _tag = TextEditingController();
   dynamic _result;
   bool _busy = false;
+  int _seq = 0; // respons permintaan lama (mode lama) diabaikan
 
   @override
   void initState() {
@@ -513,6 +513,7 @@ class _VariantsScreenState extends State<VariantsScreen> {
       return;
     }
     if (_mode != 'dot' && _tag.text.trim().isEmpty) _tag.text = _randomTag();
+    final seq = ++_seq;
     setState(() => _busy = true);
     try {
       final r = await api.variants(
@@ -521,11 +522,11 @@ class _VariantsScreenState extends State<VariantsScreen> {
         count: 30,
         tag: _tag.text.trim(),
       );
-      if (mounted) setState(() => _result = r);
+      if (mounted && seq == _seq) setState(() => _result = r);
     } catch (e) {
       if (mounted) showError(context, e);
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted && seq == _seq) setState(() => _busy = false);
     }
   }
 
@@ -743,6 +744,7 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
   final _email = TextEditingController();
   String _mode = 'dot';
   bool _random = false;
+  int _seq = 0; // respons permintaan lama (mode lama) diabaikan
   final List<dynamic> _items = [];
   dynamic _last;
   int _offset = 0;
@@ -768,6 +770,7 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
       return;
     }
     FocusScope.of(context).unfocus();
+    final seq = ++_seq;
     setState(() => _busy = true);
     try {
       final off = more ? _offset : 0;
@@ -775,10 +778,10 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
         email: email,
         mode: _mode,
         limit: _page,
-        order: _mode == 'dot' ? (_random ? 'random' : 'seq') : null,
-        offset: _random ? null : off,
+        order: _mode == 'dot' ? (_shuffled ? 'random' : 'seq') : null,
+        offset: _shuffled ? null : off,
       );
-      if (!mounted) return;
+      if (!mounted || seq != _seq) return;
       final got = listOf(r, ['items', 'variants']);
       setState(() {
         if (!more) _items.clear();
@@ -789,9 +792,12 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
     } catch (e) {
       if (mounted) showError(context, e);
     } finally {
-      if (mounted) setState(() => _busy = false);
+      if (mounted && seq == _seq) setState(() => _busy = false);
     }
   }
+
+  /// Urutan acak hanya berlaku di mode titik.
+  bool get _shuffled => _mode == 'dot' && _random;
 
   String _addrOf(dynamic v) =>
       v is Map ? (v['address'] ?? '').toString() : v.toString();
@@ -802,7 +808,7 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
     final r = _last;
     final total = _total;
     final canMore =
-        !_random && total != null && _offset < total && _items.isNotEmpty;
+        !_shuffled && total != null && _offset < total && _items.isNotEmpty;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Varian Gmail saya'),
@@ -950,7 +956,8 @@ class _AliasScreenState extends State<AliasScreen> {
       if (mounted) {
         setState(() {
           _aliases = listOf(r, ['aliases']);
-          if (r is Map && r['raw'] is String) _ctl.text = r['raw'];
+          // raw bisa null/hilang saat alias.md sudah dihapus.
+          _ctl.text = r is Map && r['raw'] is String ? r['raw'] : '';
           _dirty = false;
           _issues = [];
           _summary = null;
@@ -1098,116 +1105,141 @@ class _AliasScreenState extends State<AliasScreen> {
                 : a.toString();
             return t.toLowerCase().contains(q);
           }).toList();
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Alias (alias.md)'),
-        actions: [
-          IconButton(
-            tooltip: 'Hapus alias.md',
-            onPressed: _wipe,
-            icon: const Icon(Icons.delete_outline),
-          ),
-          IconButton(
-            tooltip: 'Muat ulang',
-            onPressed: () => _load(askIfDirty: true),
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : ListView(
-              padding: const EdgeInsets.all(16),
-              children: [
-                if (_aliases.isNotEmpty) ...[
-                  _heading('Alias terdaftar (${_aliases.length})'),
-                  if (_aliases.length > 8)
-                    TextField(
-                      controller: _find,
-                      onChanged: (_) => setState(() {}),
-                      decoration: const InputDecoration(
-                        isDense: true,
-                        labelText: 'Cari alias',
-                        prefixIcon: Icon(Icons.search),
-                      ),
-                    ),
-                  for (final a in shown.take(100))
-                    ListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      title: Text(
-                        a is Map ? (a['name'] ?? '').toString() : a.toString(),
-                      ),
-                      subtitle: Text(
-                        a is Map
-                            ? [
-                                (a['address'] ?? a['domain'] ?? '').toString(),
-                                if (a['random'] == true) 'acak',
-                              ].join(' • ')
-                            : '',
-                      ),
-                      trailing: IconButton(
-                        tooltip: 'Jadikan aktif',
-                        icon: const Icon(Icons.play_circle_outline),
-                        onPressed: () async {
-                          final addr = a is Map
-                              ? (a['address'] ?? '').toString()
-                              : '';
-                          if (addr.isEmpty) return;
-                          await appState.setActive(
-                            (a['name'] ?? addr).toString(),
-                            addr,
-                          );
-                          if (context.mounted) showOk(context, 'Aktif: $addr');
-                        },
-                      ),
-                    ),
-                  if (shown.length > 100)
-                    Text(
-                      'Menampilkan 100 dari ${shown.length}; pakai pencarian.',
-                      style: TextStyle(color: s.onSurfaceVariant),
-                    ),
-                  const SizedBox(height: 12),
-                ],
-                _heading('Isi alias.md${_dirty ? ' (belum disimpan)' : ''}'),
-                TextField(
-                  controller: _ctl,
-                  maxLines: 14,
-                  minLines: 6,
-                  autocorrect: false,
-                  onChanged: (_) {
-                    if (!_dirty) setState(() => _dirty = true);
-                  },
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
-                  decoration: const InputDecoration(
-                    alignLabelWithHint: true,
-                    labelText: 'Markdown alias',
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton(
-                        onPressed: _validate,
-                        child: const Text('Validasi'),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: FilledButton(
-                        onPressed: _saving ? null : _save,
-                        child: Text(_saving ? 'Menyimpan…' : 'Simpan'),
-                      ),
-                    ),
-                  ],
-                ),
-                if (_summary != null || _issues.isNotEmpty) ...[
-                  const SizedBox(height: 12),
-                  _issuesView(),
-                ],
-              ],
+    // Jangan buang suntingan alias.md yang belum disimpan saat menekan kembali.
+    return PopScope(
+      canPop: !_dirty,
+      onPopInvokedWithResult: (didPop, _) async {
+        if (didPop) return;
+        final ok = await confirmDialog(
+          context,
+          title: 'Buang perubahan?',
+          body: 'Suntingan alias.md yang belum disimpan akan hilang.',
+          confirmLabel: 'Buang',
+        );
+        if (ok && context.mounted) {
+          setState(() => _dirty = false);
+          Navigator.pop(context);
+        }
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Alias (alias.md)'),
+          actions: [
+            IconButton(
+              tooltip: 'Hapus alias.md',
+              onPressed: _wipe,
+              icon: const Icon(Icons.delete_outline),
             ),
+            IconButton(
+              tooltip: 'Muat ulang',
+              onPressed: () => _load(askIfDirty: true),
+              icon: const Icon(Icons.refresh),
+            ),
+          ],
+        ),
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : ListView(
+                padding: const EdgeInsets.all(16),
+                children: [
+                  if (_aliases.isNotEmpty) ...[
+                    _heading('Alias terdaftar (${_aliases.length})'),
+                    if (_aliases.length > 8)
+                      TextField(
+                        controller: _find,
+                        onChanged: (_) => setState(() {}),
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          labelText: 'Cari alias',
+                          prefixIcon: Icon(Icons.search),
+                        ),
+                      ),
+                    for (final a in shown.take(100))
+                      ListTile(
+                        dense: true,
+                        contentPadding: EdgeInsets.zero,
+                        title: Text(
+                          a is Map
+                              ? (a['name'] ?? '').toString()
+                              : a.toString(),
+                        ),
+                        subtitle: Text(
+                          a is Map
+                              ? [
+                                  (a['address'] ?? a['domain'] ?? '')
+                                      .toString(),
+                                  if (a['random'] == true) 'acak',
+                                ].join(' • ')
+                              : '',
+                        ),
+                        trailing: IconButton(
+                          tooltip: 'Jadikan aktif',
+                          icon: const Icon(Icons.play_circle_outline),
+                          onPressed: () async {
+                            final addr = a is Map
+                                ? (a['address'] ?? '').toString()
+                                : '';
+                            if (addr.isEmpty) return;
+                            await appState.setActive(
+                              (a['name'] ?? addr).toString(),
+                              addr,
+                            );
+                            if (context.mounted) {
+                              showOk(context, 'Aktif: $addr');
+                            }
+                          },
+                        ),
+                      ),
+                    if (shown.length > 100)
+                      Text(
+                        'Menampilkan 100 dari ${shown.length}; pakai pencarian.',
+                        style: TextStyle(color: s.onSurfaceVariant),
+                      ),
+                    const SizedBox(height: 12),
+                  ],
+                  _heading('Isi alias.md${_dirty ? ' (belum disimpan)' : ''}'),
+                  TextField(
+                    controller: _ctl,
+                    maxLines: 14,
+                    minLines: 6,
+                    autocorrect: false,
+                    onChanged: (_) {
+                      if (!_dirty) setState(() => _dirty = true);
+                    },
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 13,
+                    ),
+                    decoration: const InputDecoration(
+                      alignLabelWithHint: true,
+                      labelText: 'Markdown alias',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: _validate,
+                          child: const Text('Validasi'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: FilledButton(
+                          onPressed: _saving ? null : _save,
+                          child: Text(_saving ? 'Menyimpan…' : 'Simpan'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_summary != null || _issues.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    _issuesView(),
+                  ],
+                ],
+              ),
+      ),
     );
   }
 }
@@ -2117,7 +2149,6 @@ class _AdminScreenState extends State<AdminScreen> {
       ),
     );
     final text = ctl.text;
-    ctl.dispose();
     if (ok != true) return;
     try {
       final parsed = jsonDecode(text);

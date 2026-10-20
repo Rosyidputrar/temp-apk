@@ -18,6 +18,7 @@ class _OtpScreenState extends State<OtpScreen> {
   dynamic _latest;
   String? _latestEmpty; // pesan ramah bila belum ada OTP
   bool _loadingLatest = false;
+  int _refGen = 0; // naik saat alamat berganti → request alamat lama diabaikan
   dynamic _waitResult;
   bool _waitStale = false;
   bool _waiting = false;
@@ -82,8 +83,10 @@ class _OtpScreenState extends State<OtpScreen> {
       _sub = null;
       _stopWaitTick();
       _waitGen++;
+      _refGen++;
       setState(() {
         _shownRef = appState.activeRef;
+        _loadingLatest = false;
         _latest = null;
         _latestEmpty = null;
         _waitResult = null;
@@ -119,17 +122,18 @@ class _OtpScreenState extends State<OtpScreen> {
   Future<void> _loadLatest() async {
     final ref = _ref;
     if (ref == null) return;
+    final gen = _refGen;
     setState(() => _loadingLatest = true);
     try {
       final r = await api.otpLatest(ref);
-      if (mounted && ref == _ref) {
+      if (mounted && gen == _refGen) {
         setState(() {
           _latest = r;
           _latestEmpty = null;
         });
       }
     } on ApiException catch (e) {
-      if (!mounted || ref != _ref) return;
+      if (!mounted || gen != _refGen) return;
       if (e.code == 'NO_OTP' || e.status == 404) {
         setState(() {
           _latest = null;
@@ -139,9 +143,9 @@ class _OtpScreenState extends State<OtpScreen> {
         showError(context, e);
       }
     } catch (e) {
-      if (mounted) showError(context, e);
+      if (mounted && gen == _refGen) showError(context, e);
     } finally {
-      if (mounted) setState(() => _loadingLatest = false);
+      if (mounted && gen == _refGen) setState(() => _loadingLatest = false);
     }
   }
 
@@ -337,12 +341,13 @@ class _OtpScreenState extends State<OtpScreen> {
   Future<void> _verify(bool wait) async {
     final ref = _ref;
     if (ref == null) return;
+    final gen = _refGen;
     if (wait) setState(() => _verifyWaiting = true);
     try {
       final r = wait
           ? await api.verifyWait(ref, timeout: _timeout)
           : await api.verifyLatest(ref);
-      if (mounted && ref == _ref) {
+      if (mounted && gen == _refGen) {
         setState(() {
           if (wait) {
             _verifyWait = r;
@@ -352,9 +357,11 @@ class _OtpScreenState extends State<OtpScreen> {
         });
       }
     } catch (e) {
-      if (mounted) showError(context, e);
+      if (mounted && gen == _refGen) showError(context, e);
     } finally {
-      if (mounted && wait) setState(() => _verifyWaiting = false);
+      if (mounted && wait && gen == _refGen) {
+        setState(() => _verifyWaiting = false);
+      }
     }
   }
 
