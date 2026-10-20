@@ -70,6 +70,8 @@ jobs:
           flutter build apk --release --split-per-abi \
             --dart-define=API_BASE=https://rest-tempmail.rosdiyttaa.workers.dev \
             --dart-define=API_TOKEN="$API_TOKEN" \
+            --dart-define=APP_BUILD=${{ github.run_number }} \
+            --dart-define=UPDATE_REPO=${{ github.repository }} \
             --build-number=${{ github.run_number }}
 
       - name: Unggah APK sebagai artifact
@@ -86,4 +88,6 @@ jobs:
         with:
           tag_name: b${{ github.run_number }}
           name: Build ${{ github.run_number }}
-          files: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          make_latest: true
+          # Semua APK per ABI: pembaruan di aplikasi memilih yang cocok dengan HP.
+          files: build/app/outputs/flutter-apk/app-*-release.apk

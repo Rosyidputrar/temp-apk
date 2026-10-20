@@ -50,6 +50,21 @@ void main() {
       expect(listOf('x'), isEmpty);
     });
 
+    test('quickGroupCounts cocokkan nama grup secara longgar', () {
+      final c = quickGroupCounts(
+        {
+          'groups': [
+            {'name': 'Premium ', 'count': 23},
+            {'name': 'basic', 'count': 105},
+            {'name': 'standard', 'count': '75'},
+          ],
+        },
+        ['premium', 'basic', 'standard', 'semua'],
+      );
+      expect(c, {'premium': 23, 'basic': 105, 'standard': 75, 'semua': 203});
+      expect(quickGroupCounts(null, ['premium']), isEmpty);
+    });
+
     test('msgTimeShort pakai umur pesan bila ada', () {
       expect(msgTimeShort({'age_seconds': 300}), '5 mnt lalu');
       expect(msgTimeShort({}), '');
@@ -62,6 +77,21 @@ void main() {
 
     expect(find.text('TempMail'), findsWidgets);
     expect(find.text('Buat cepat'), findsOneWidget);
+
+    // Beranda bisa di-refresh: tombol di AppBar + tarik ke bawah.
+    expect(find.byTooltip('Muat ulang'), findsOneWidget);
+    await tester.tap(find.byTooltip('Muat ulang'));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 200)),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.fling(find.text('Buat cepat'), const Offset(0, 400), 1000);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 200)),
+    );
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(RefreshIndicator), findsWidgets);
 
     // Tab OTP tanpa alamat aktif.
     await tester.tap(find.text('OTP').last);

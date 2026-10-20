@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 
 import 'api.dart';
 import 'main.dart';
+import 'update.dart';
 import 'screens_main.dart' show fmtTime, parseApiTime;
 
 /// "baru saja" / "5 mnt lalu" dari waktu ISO.
@@ -439,6 +440,12 @@ class MoreScreen extends StatelessWidget {
         'Admin',
         'Log, config, domain & pola OTP kustom',
         const AdminScreen(),
+      ),
+      (
+        Icons.system_update_outlined,
+        'Pembaruan aplikasi',
+        'Cek versi terbaru, unduh & pasang APK',
+        const UpdateScreen(),
       ),
       (
         Icons.info_outline,
@@ -2430,6 +2437,20 @@ class _AboutScreenState extends State<AboutScreen> {
                         : 'Token API terpasang',
                   ),
                   subtitle: const Text('Disuntik saat build via --dart-define'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.system_update_outlined),
+                  title: Text(
+                    kAppBuild > 0
+                        ? 'Versi aplikasi: b$kAppBuild'
+                        : 'Versi aplikasi: build lokal',
+                  ),
+                  subtitle: const Text('Ketuk untuk cek pembaruan'),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const UpdateScreen()),
+                  ),
                 ),
               ],
             ),

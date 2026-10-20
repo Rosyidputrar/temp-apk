@@ -6,6 +6,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import 'api.dart';
 import 'main.dart';
+import 'update.dart';
 
 /// Parse waktu dari API. String tanpa zona waktu (mis. "2026-10-20 16:04:48",
 /// yang oleh web resmi ditampilkan sebagai UTC) dianggap UTC.
@@ -80,6 +81,33 @@ String _str(dynamic v, [String fallback = '']) {
   return s.trim().isEmpty ? fallback : s;
 }
 
+/// Jumlah domain per tombol "Buat cepat" dari respons /v1/domains/groups.
+/// Nama grup dari server bisa beda huruf besar/spasi ("Premium ",
+/// "premium-domains", ...), jadi dicocokkan longgar. `semua` = total.
+Map<String, int> quickGroupCounts(dynamic r, List<String> quick) {
+  final counts = <String, int>{};
+  var total = 0;
+  for (final g in listOf(r, ['groups', 'items'])) {
+    if (g is! Map) continue;
+    final raw = g['count'];
+    final c = raw is num ? raw.toInt() : int.tryParse('$raw') ?? 0;
+    total += c;
+    final names = [
+      g['name'],
+      g['key'],
+      g['id'],
+      g['slug'],
+    ].where((v) => v != null).map((v) => v.toString().trim().toLowerCase());
+    for (final q in quick) {
+      if (q != 'semua' && names.any((n) => n == q || n.startsWith(q))) {
+        counts[q] = (counts[q] ?? 0) + c;
+      }
+    }
+  }
+  if (total > 0) counts['semua'] = total;
+  return counts;
+}
+
 // ============================ BERANDA ============================
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -98,6 +126,7 @@ class _HomeScreenState extends State<HomeScreen> {
   dynamic _info;
   String? _infoRef;
   Map<String, int> _groupCounts = {};
+  bool _refreshing = false;
 
   static const _quickGroups = ['premium', 'basic', 'standard', 'semua'];
 
@@ -110,6 +139,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void initState() {
     super.initState();
     appState.addListener(_onState);
+    currentTab.addListener(_onTab);
     _loadInfo();
     _loadGroupCounts();
   }
@@ -117,6 +147,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     appState.removeListener(_onState);
+    currentTab.removeListener(_onTab);
     _alias.dispose();
     _domain.dispose();
     _group.dispose();
@@ -133,7 +164,13 @@ class _HomeScreenState extends State<HomeScreen> {
     _loadInfo();
   }
 
-  Future<void> _loadInfo() async {
+  // Kembali ke Beranda dari tab lain → jumlah pesan ikut diperbarui.
+  void _onTab() {
+    if (currentTab.value == kTabHome) _loadInfo();
+  }
+
+  /// [showErrors] = tampilkan galat (saat refresh manual); muat otomatis diam.
+  Future<void> _loadInfo({bool showErrors = false}) async {
     final ref = appState.activeRef;
     if (ref == null) return;
     try {
@@ -144,22 +181,26 @@ class _HomeScreenState extends State<HomeScreen> {
           _infoRef = ref;
         });
       }
-    } catch (_) {}
+    } catch (e) {
+      if (showErrors && mounted) showError(context, e);
+    }
+  }
+
+  /// Tarik ke bawah / tombol refresh: info mailbox + jumlah domain per grup.
+  Future<void> _refresh() async {
+    if (_refreshing) return;
+    setState(() => _refreshing = true);
+    try {
+      await Future.wait([_loadInfo(showErrors: true), _loadGroupCounts()]);
+    } finally {
+      if (mounted) setState(() => _refreshing = false);
+    }
   }
 
   Future<void> _loadGroupCounts() async {
     try {
       final r = await api.domainGroups();
-      final counts = <String, int>{};
-      var total = 0;
-      for (final g in listOf(r, ['groups', 'items'])) {
-        if (g is Map && g['name'] != null) {
-          final c = (g['count'] as num?)?.toInt() ?? 0;
-          counts[g['name'].toString()] = c;
-          total += c;
-        }
-      }
-      if (total > 0) counts['semua'] = counts['semua'] ?? total;
+      final counts = quickGroupCounts(r, _quickGroups);
       if (mounted) setState(() => _groupCounts = counts);
     } catch (_) {}
   }
@@ -269,271 +310,291 @@ class _HomeScreenState extends State<HomeScreen> {
     final ref = appState.activeRef;
     final count = _countLabel();
     return Scaffold(
-      appBar: AppBar(title: const Text('TempMail')),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          if (kApiToken.isEmpty) ...[
-            Card(
-              color: s.errorContainer,
-              child: ListTile(
-                leading: Icon(
-                  Icons.key_off_outlined,
-                  color: s.onErrorContainer,
-                ),
-                title: Text(
-                  'Token API belum terpasang',
-                  style: TextStyle(
-                    color: s.onErrorContainer,
-                    fontWeight: FontWeight.w700,
-                  ),
-                ),
-                subtitle: Text(
-                  'Build ulang dengan --dart-define=API_TOKEN=... agar aplikasi bisa memanggil server.',
-                  style: TextStyle(color: s.onErrorContainer),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-          ],
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      Icon(Icons.alternate_email, color: s.primary),
-                      const SizedBox(width: 8),
-                      const Expanded(
-                        child: Text(
-                          'Mailbox aktif',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
-                          ),
-                        ),
-                      ),
-                      if (count.isNotEmpty)
-                        Chip(
-                          label: Text(count),
-                          visualDensity: VisualDensity.compact,
-                          side: BorderSide.none,
-                          backgroundColor: s.secondaryContainer,
-                        ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-                  if (addr == null)
-                    Text(
-                      'Belum ada alamat aktif. Buat dulu di bawah ya.',
-                      style: TextStyle(color: s.onSurfaceVariant),
-                    )
-                  else ...[
-                    SelectableText(
-                      addr,
-                      style: const TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    if (ref != null && ref != addr)
-                      Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Text(
-                          'ref: $ref',
-                          style: TextStyle(color: s.onSurfaceVariant),
-                        ),
-                      ),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: FilledButton.icon(
-                            style: _compact,
-                            onPressed: () =>
-                                copyText(context, addr, 'Alamat disalin'),
-                            icon: const Icon(Icons.copy, size: 18),
-                            label: const Text('Salin'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: FilledButton.tonalIcon(
-                            style: _compact,
-                            onPressed: () => currentTab.value = kTabInbox,
-                            icon: const Icon(Icons.inbox, size: 18),
-                            label: const Text('Inbox'),
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: FilledButton.tonalIcon(
-                            style: _compact,
-                            onPressed: () => currentTab.value = kTabOtp,
-                            icon: const Icon(Icons.pin, size: 18),
-                            label: const Text('OTP'),
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Wrap(
-                      spacing: 8,
-                      runSpacing: 8,
-                      children: [
-                        OutlinedButton.icon(
-                          onPressed: () => _action('fav'),
-                          icon: const Icon(Icons.star_outline, size: 18),
-                          label: const Text('Favorit'),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed: () => _action('read'),
-                          icon: const Icon(Icons.done_all, size: 18),
-                          label: const Text('Tandai dibaca'),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed: () => _action('cache'),
-                          icon: const Icon(
-                            Icons.cleaning_services_outlined,
-                            size: 18,
-                          ),
-                          label: const Text('Bersih cache'),
-                        ),
-                        OutlinedButton.icon(
-                          onPressed: () => _action('wipe'),
-                          icon: Icon(
-                            Icons.delete_forever_outlined,
-                            size: 18,
-                            color: s.error,
-                          ),
-                          label: Text(
-                            'Hapus inbox',
-                            style: TextStyle(color: s.error),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 20),
-          const Text(
-            'Buat cepat',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 4),
-          Text(
-            'Alamat acak per jenis domain, langsung aktif & disalin.',
-            style: TextStyle(color: s.onSurfaceVariant),
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              for (final g in _quickGroups)
-                ActionChip(
-                  avatar: _busyGroup == g
-                      ? const SizedBox(
-                          width: 16,
-                          height: 16,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.bolt, size: 16),
-                  label: Text(
-                    _groupCounts[g] == null ? g : '$g · ${_groupCounts[g]}',
-                  ),
-                  onPressed: _busy ? null : () => _create(quickGroup: g),
-                ),
-            ],
-          ),
-          const SizedBox(height: 20),
-          const Text(
-            'Buat manual',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _alias,
-            textInputAction: TextInputAction.next,
-            autocorrect: false,
-            decoration: const InputDecoration(
-              labelText: 'Alias (kosong = acak dari alias.md)',
-              prefixIcon: Icon(Icons.person_outline),
-            ),
-          ),
-          const SizedBox(height: 10),
-          TextField(
-            controller: _domain,
-            textInputAction: TextInputAction.next,
-            autocorrect: false,
-            keyboardType: TextInputType.url,
-            decoration: const InputDecoration(
-              labelText: 'Domain (opsional)',
-              prefixIcon: Icon(Icons.language),
-            ),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _group,
-                  textInputAction: TextInputAction.next,
-                  autocorrect: false,
-                  decoration: const InputDecoration(
-                    labelText: 'Grup domain',
-                    prefixIcon: Icon(Icons.folder_outlined),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: TextField(
-                  controller: _saveAs,
-                  autocorrect: false,
-                  textInputAction: TextInputAction.done,
-                  onSubmitted: (_) => _busy ? null : _create(),
-                  decoration: const InputDecoration(
-                    labelText: 'Simpan sbg alias',
-                    prefixIcon: Icon(Icons.bookmark_outline),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 14),
-          FilledButton.icon(
-            onPressed: _busy ? null : () => _create(),
-            icon: _busy && _busyGroup == null
+      appBar: AppBar(
+        title: const Text('TempMail'),
+        actions: [
+          IconButton(
+            tooltip: 'Muat ulang',
+            onPressed: _refreshing ? null : _refresh,
+            icon: _refreshing
                 ? const SizedBox(
-                    width: 18,
-                    height: 18,
+                    width: 20,
+                    height: 20,
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
-                : const Icon(Icons.add),
-            label: const Text('Buat alamat'),
+                : const Icon(Icons.refresh),
           ),
-          if (_lastCreated != null) ...[
-            const SizedBox(height: 12),
-            Theme(
-              data: Theme.of(context)
-                  .copyWith(dividerColor: Colors.transparent),
-              child: ExpansionTile(
-                tilePadding: EdgeInsets.zero,
-                title: const Text(
-                  'Detail respons pembuatan',
-                  style: TextStyle(fontWeight: FontWeight.w600),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: _refresh,
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.all(16),
+          children: [
+            const UpdateBanner(),
+            if (kApiToken.isEmpty) ...[
+              Card(
+                color: s.errorContainer,
+                child: ListTile(
+                  leading: Icon(
+                    Icons.key_off_outlined,
+                    color: s.onErrorContainer,
+                  ),
+                  title: Text(
+                    'Token API belum terpasang',
+                    style: TextStyle(
+                      color: s.onErrorContainer,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  subtitle: Text(
+                    'Build ulang dengan --dart-define=API_TOKEN=... agar aplikasi bisa memanggil server.',
+                    style: TextStyle(color: s.onErrorContainer),
+                  ),
                 ),
-                children: [JsonView(_lastCreated)],
+              ),
+              const SizedBox(height: 12),
+            ],
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.alternate_email, color: s.primary),
+                        const SizedBox(width: 8),
+                        const Expanded(
+                          child: Text(
+                            'Mailbox aktif',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                        ),
+                        if (count.isNotEmpty)
+                          Chip(
+                            label: Text(count),
+                            visualDensity: VisualDensity.compact,
+                            side: BorderSide.none,
+                            backgroundColor: s.secondaryContainer,
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    if (addr == null)
+                      Text(
+                        'Belum ada alamat aktif. Buat dulu di bawah ya.',
+                        style: TextStyle(color: s.onSurfaceVariant),
+                      )
+                    else ...[
+                      SelectableText(
+                        addr,
+                        style: const TextStyle(
+                          fontSize: 17,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      if (ref != null && ref != addr)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'ref: $ref',
+                            style: TextStyle(color: s.onSurfaceVariant),
+                          ),
+                        ),
+                      const SizedBox(height: 12),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: FilledButton.icon(
+                              style: _compact,
+                              onPressed: () =>
+                                  copyText(context, addr, 'Alamat disalin'),
+                              icon: const Icon(Icons.copy, size: 18),
+                              label: const Text('Salin'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: FilledButton.tonalIcon(
+                              style: _compact,
+                              onPressed: () => currentTab.value = kTabInbox,
+                              icon: const Icon(Icons.inbox, size: 18),
+                              label: const Text('Inbox'),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: FilledButton.tonalIcon(
+                              style: _compact,
+                              onPressed: () => currentTab.value = kTabOtp,
+                              icon: const Icon(Icons.pin, size: 18),
+                              label: const Text('OTP'),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: () => _action('fav'),
+                            icon: const Icon(Icons.star_outline, size: 18),
+                            label: const Text('Favorit'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: () => _action('read'),
+                            icon: const Icon(Icons.done_all, size: 18),
+                            label: const Text('Tandai dibaca'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: () => _action('cache'),
+                            icon: const Icon(
+                              Icons.cleaning_services_outlined,
+                              size: 18,
+                            ),
+                            label: const Text('Bersih cache'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: () => _action('wipe'),
+                            icon: Icon(
+                              Icons.delete_forever_outlined,
+                              size: 18,
+                              color: s.error,
+                            ),
+                            label: Text(
+                              'Hapus inbox',
+                              style: TextStyle(color: s.error),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
               ),
             ),
+            const SizedBox(height: 20),
+            const Text(
+              'Buat cepat',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Alamat acak per jenis domain, langsung aktif & disalin.',
+              style: TextStyle(color: s.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final g in _quickGroups)
+                  ActionChip(
+                    avatar: _busyGroup == g
+                        ? const SizedBox(
+                            width: 16,
+                            height: 16,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.bolt, size: 16),
+                    label: Text(
+                      _groupCounts[g] == null ? g : '$g · ${_groupCounts[g]}',
+                    ),
+                    onPressed: _busy ? null : () => _create(quickGroup: g),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              'Buat manual',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _alias,
+              textInputAction: TextInputAction.next,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                labelText: 'Alias (kosong = acak dari alias.md)',
+                prefixIcon: Icon(Icons.person_outline),
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _domain,
+              textInputAction: TextInputAction.next,
+              autocorrect: false,
+              keyboardType: TextInputType.url,
+              decoration: const InputDecoration(
+                labelText: 'Domain (opsional)',
+                prefixIcon: Icon(Icons.language),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _group,
+                    textInputAction: TextInputAction.next,
+                    autocorrect: false,
+                    decoration: const InputDecoration(
+                      labelText: 'Grup domain',
+                      prefixIcon: Icon(Icons.folder_outlined),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: TextField(
+                    controller: _saveAs,
+                    autocorrect: false,
+                    textInputAction: TextInputAction.done,
+                    onSubmitted: (_) => _busy ? null : _create(),
+                    decoration: const InputDecoration(
+                      labelText: 'Simpan sbg alias',
+                      prefixIcon: Icon(Icons.bookmark_outline),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            FilledButton.icon(
+              onPressed: _busy ? null : () => _create(),
+              icon: _busy && _busyGroup == null
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.add),
+              label: const Text('Buat alamat'),
+            ),
+            if (_lastCreated != null) ...[
+              const SizedBox(height: 12),
+              Theme(
+                data: Theme.of(context)
+                    .copyWith(dividerColor: Colors.transparent),
+                child: ExpansionTile(
+                  tilePadding: EdgeInsets.zero,
+                  title: const Text(
+                    'Detail respons pembuatan',
+                    style: TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                  children: [JsonView(_lastCreated)],
+                ),
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
