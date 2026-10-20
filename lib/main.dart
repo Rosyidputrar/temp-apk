@@ -10,7 +10,9 @@ import 'package:path_provider/path_provider.dart';
 import 'api.dart';
 import 'screens_main.dart';
 import 'screens_otp.dart';
+import 'notify.dart';
 import 'screens_more.dart';
+import 'update.dart';
 
 final api = TempmailApi();
 
@@ -67,6 +69,35 @@ class AppState extends ChangeNotifier {
 
 final appState = AppState();
 
+/// Untuk membuka layar dari luar widget tree (mis. dari tombol notifikasi).
+final navigatorKey = GlobalKey<NavigatorState>();
+
+/// Ketukan notifikasi yang butuh UI: salin OTP / buka layar pembaruan.
+void _onNotificationAction(String action, String payload) {
+  Map p = const {};
+  try {
+    p = jsonDecode(payload) as Map;
+  } catch (_) {}
+  switch (p['t']) {
+    case 'otp':
+      final code = p['code']?.toString();
+      if (code != null && code.isNotEmpty) {
+        Clipboard.setData(ClipboardData(text: code));
+      }
+      navigatorKey.currentState?.popUntil((r) => r.isFirst);
+      currentTab.value = kTabOtp;
+    case 'wait':
+      if (action.isEmpty) {
+        navigatorKey.currentState?.popUntil((r) => r.isFirst);
+        currentTab.value = kTabOtp;
+      }
+    case 'update':
+      if (action.isEmpty || action == 'upd_install') {
+        openUpdateScreen(autoInstall: action == 'upd_install');
+      }
+  }
+}
+
 /// Tab bawah yang sedang tampil. Layar di dalam IndexedStack tetap hidup
 /// walau tidak terlihat, jadi mereka memakai ini untuk tahu kapan perlu
 /// memuat ulang (Favorit) atau menghentikan auto-refresh (Inbox).
@@ -109,6 +140,12 @@ void main() {
     );
   };
   runApp(const TempMailApp());
+  // Setelah frame pertama: notifikasi & cek pembaruan (tidak memblokir UI).
+  Notifier.instance.addListener(_onNotificationAction);
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    await Notifier.instance.init();
+    await UpdateService.instance.init();
+  });
 }
 
 class TempMailApp extends StatelessWidget {
@@ -180,6 +217,7 @@ class TempMailApp extends StatelessWidget {
     );
     return MaterialApp(
       title: 'TempMail',
+      navigatorKey: navigatorKey,
       debugShowCheckedModeBanner: false,
       theme: theme(scheme),
       darkTheme: theme(darkScheme),

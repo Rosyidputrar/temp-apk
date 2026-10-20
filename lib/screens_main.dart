@@ -6,6 +6,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import 'api.dart';
 import 'main.dart';
+import 'update.dart';
 
 /// Parse waktu dari API. String tanpa zona waktu (mis. "2026-10-20 16:04:48",
 /// yang oleh web resmi ditampilkan sebagai UTC) dianggap UTC.
@@ -331,6 +332,7 @@ class _HomeScreenState extends State<HomeScreen> {
           physics: const AlwaysScrollableScrollPhysics(),
           padding: const EdgeInsets.all(16),
           children: [
+            const UpdateBanner(),
             if (kApiToken.isEmpty) ...[
               Card(
                 color: s.errorContainer,

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import 'api.dart';
 import 'main.dart';
+import 'notify.dart';
 
 class OtpScreen extends StatefulWidget {
   const OtpScreen({super.key});
@@ -29,6 +30,7 @@ class _OtpScreenState extends State<OtpScreen> {
   final _refsCtl = TextEditingController();
   dynamic _waitAnyResult;
   bool _waitingAny = false;
+  int _anyGen = 0; // naik saat dihentikan dari notifikasi
   String _waitAnyMode = 'otp';
 
   StreamSubscription? _sub;
@@ -50,6 +52,33 @@ class _OtpScreenState extends State<OtpScreen> {
     _shownRef = appState.activeRef;
     appState.addListener(_onState);
     currentTab.addListener(_onTab);
+    Notifier.instance.addListener(_onNotif);
+  }
+
+  /// Tombol "Berhenti" di notifikasi status menunggu.
+  void _onNotif(String action, String payload) {
+    if (action != 'wait_stop' || !mounted) return;
+    if (_waiting) _wait();
+    if (_streaming) _toggleStream();
+    if (_waitingAny) {
+      _anyGen++;
+      setState(() => _waitingAny = false);
+      Notifier.instance.setWaiting('any', null);
+    }
+  }
+
+  String get _addr => appState.activeAddress ?? _ref ?? '';
+
+  /// Notifikasi OTP hanya bila pengguna tidak sedang melihat tab OTP.
+  void _notifyOtp(String code, dynamic msg, {String? address}) {
+    if (Notifier.instance.inForeground && currentTab.value == kTabOtp) return;
+    final m = msg is Map ? msg : const {};
+    Notifier.instance.otpArrived(
+      code,
+      subject: m['subject']?.toString(),
+      from: m['from']?.toString(),
+      address: address ?? _addr,
+    );
   }
 
   // Buka tab OTP → langsung tampilkan OTP terbaru (sekali per alamat).
@@ -67,6 +96,8 @@ class _OtpScreenState extends State<OtpScreen> {
   void dispose() {
     appState.removeListener(_onState);
     currentTab.removeListener(_onTab);
+    Notifier.instance.removeListener(_onNotif);
+    Notifier.instance.clearWaiting();
     _sub?.cancel();
     _waitTick?.cancel();
     _timeoutCtl.dispose();
@@ -84,6 +115,8 @@ class _OtpScreenState extends State<OtpScreen> {
       _stopWaitTick();
       _waitGen++;
       _refGen++;
+      Notifier.instance.setWaiting('wait', null);
+      Notifier.instance.setWaiting('stream', null);
       setState(() {
         _shownRef = appState.activeRef;
         _loadingLatest = false;
@@ -185,6 +218,7 @@ class _OtpScreenState extends State<OtpScreen> {
       // Batal: request HTTP tetap jalan di belakang, hasilnya diabaikan.
       _waitGen++;
       _stopWaitTick();
+      Notifier.instance.setWaiting('wait', null);
       setState(() => _waiting = false);
       showOk(context, 'Menunggu dibatalkan');
       return;
@@ -192,6 +226,11 @@ class _OtpScreenState extends State<OtpScreen> {
     final ref = _ref;
     if (ref == null) return;
     final gen = ++_waitGen;
+    final addr = _addr;
+    // Status di notifikasi + foreground service: tetap menunggu walau
+    // aplikasi ditinggal ke situs pendaftaran.
+    Notifier.instance.ensurePermission();
+    Notifier.instance.setWaiting('wait', '$addr · maks $_timeout dtk');
     setState(() {
       _waiting = true;
       _waitResult = null;
@@ -206,12 +245,23 @@ class _OtpScreenState extends State<OtpScreen> {
       if (!mounted || gen != _waitGen) return;
       setState(() => _waitResult = r);
       final code = r is Map ? r['otp']?.toString() : null;
-      if (code != null && code.isNotEmpty) _autoCopy(code);
+      if (code != null && code.isNotEmpty) {
+        _autoCopy(code);
+        _notifyOtp(code, r is Map ? r['message'] : null, address: addr);
+      }
     } catch (e) {
       if (!mounted || gen != _waitGen) return;
       final stale = e is ApiException && e.details is Map
           ? (e.details as Map)['stale_otp']
           : null;
+      if (!Notifier.instance.inForeground) {
+        Notifier.instance.otpInfo(
+          'Waktu tunggu OTP habis',
+          stale is Map
+              ? 'Tidak ada OTP baru untuk $addr. OTP lama: ${stale['otp']}'
+              : 'Belum ada OTP baru untuk $addr. Buka aplikasi untuk menunggu lagi.',
+        );
+      }
       setState(() {
         if (stale is Map) {
           _waitResult = {'otp': stale['otp'], 'message': stale};
@@ -228,6 +278,7 @@ class _OtpScreenState extends State<OtpScreen> {
     } finally {
       if (gen == _waitGen) {
         _stopWaitTick();
+        Notifier.instance.setWaiting('wait', null);
         if (mounted) setState(() => _waiting = false);
       }
     }
@@ -248,18 +299,35 @@ class _OtpScreenState extends State<OtpScreen> {
       showError(context, 'Maksimal 10 alamat (sekarang ${refs.length})');
       return;
     }
+    final gen = ++_anyGen;
     setState(() {
       _waitingAny = true;
       _waitAnyResult = null;
     });
+    Notifier.instance.ensurePermission();
+    Notifier.instance.setWaiting(
+      'any',
+      '${refs.length} alamat (${_waitAnyMode == 'link' ? 'link' : 'OTP'})',
+    );
     try {
       final r = await api.otpWaitAny(
         refs: refs,
         timeout: _timeout,
         mode: _waitAnyMode,
       );
+      if (gen != _anyGen) return;
       if (mounted) setState(() => _waitAnyResult = r);
+      final code = r is Map ? r['otp']?.toString() : null;
+      if (code != null && code.isNotEmpty) {
+        _autoCopy(code);
+        _notifyOtp(
+          code,
+          r['message'],
+          address: (r['address'] ?? r['ref'])?.toString(),
+        );
+      }
     } catch (e) {
+      if (gen != _anyGen) return;
       if (mounted) {
         setState(
           () => _waitAnyResult = {
@@ -269,7 +337,10 @@ class _OtpScreenState extends State<OtpScreen> {
         );
       }
     } finally {
-      if (mounted) setState(() => _waitingAny = false);
+      if (gen == _anyGen) {
+        Notifier.instance.setWaiting('any', null);
+        if (mounted) setState(() => _waitingAny = false);
+      }
     }
   }
 
@@ -277,15 +348,19 @@ class _OtpScreenState extends State<OtpScreen> {
     if (_streaming) {
       _sub?.cancel();
       _sub = null;
+      Notifier.instance.setWaiting('stream', null);
       setState(() => _streaming = false);
       return;
     }
     final ref = _ref;
     if (ref == null) return;
+    final addr = _addr;
     setState(() {
       _streaming = true;
       _streamLog.clear();
     });
+    Notifier.instance.ensurePermission();
+    Notifier.instance.setWaiting('stream', 'Stream real-time · $addr');
     _sub = api
         .otpStream(ref)
         .listen(
@@ -306,14 +381,17 @@ class _OtpScreenState extends State<OtpScreen> {
             });
             if (ev['event'] == 'otp' && code != null) {
               _autoCopy(code.toString());
+              _notifyOtp(code.toString(), ev, address: addr);
             }
             if (ev['event'] == 'timeout') {
               _sub?.cancel();
               _sub = null;
+              Notifier.instance.setWaiting('stream', null);
               setState(() => _streaming = false);
             }
           },
           onError: (e) {
+            Notifier.instance.setWaiting('stream', null);
             if (mounted) {
               setState(() {
                 _streamLog.insert(0, 'error: ${errorText(e)}');
@@ -322,6 +400,7 @@ class _OtpScreenState extends State<OtpScreen> {
             }
           },
           onDone: () {
+            Notifier.instance.setWaiting('stream', null);
             if (mounted) setState(() => _streaming = false);
           },
         );

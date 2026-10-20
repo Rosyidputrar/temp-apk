@@ -6,6 +6,19 @@ mailbox, inbox, OTP (terbaru/tunggu/stream/riwayat/ekstrak), link verifikasi,
 favorit, varian titik/plus + Gmail, alias.md, domain, riwayat, pantauan &
 notifikasi, debug, dan admin.
 
+## Notifikasi & pembaruan
+
+- **Notifikasi OTP**: saat "Tunggu OTP", stream, atau tunggu banyak alamat
+  berjalan, aplikasi tetap menunggu walau ditinggal (foreground service,
+  notifikasi status dengan tombol **Berhenti**). OTP yang masuk langsung
+  disalin dan muncul sebagai notifikasi.
+- **Pembaruan lewat APK** (Menu → Pembaruan aplikasi): versi terbaru dibaca
+  dari GitHub Releases repo ini (`UPDATE_REPO`, otomatis dari CI). Unduhan
+  berjalan di latar dan bisa dijeda/dilanjutkan/dibatalkan, diverifikasi
+  ukuran + SHA-256, lalu dipasang lewat installer Android.
+- Pembaruan hanya bisa dipasang di atas versi yang **ditandatangani keystore
+  yang sama** — pastikan secret `KEYSTORE_*` selalu terisi di CI.
+
 ## Keamanan token
 
 Token API **tidak ada di kode**. Ia disuntik saat build:
