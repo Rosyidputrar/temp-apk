@@ -775,7 +775,7 @@ class _HistoryScreenState extends State<HistoryScreen>
             icon: const Icon(Icons.delete_sweep_outlined),
           ),
         ],
-        bottom: const TabBar(tabs: [
+        bottom: TabBar(controller: _tabs, tabs: const [
           Tab(text: 'Baru dipakai'),
           Tab(text: 'Feed aktivitas'),
         ]),

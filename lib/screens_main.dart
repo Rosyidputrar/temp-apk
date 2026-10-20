@@ -277,6 +277,7 @@ class InboxScreen extends StatefulWidget {
 
 class _InboxScreenState extends State<InboxScreen> {
   List<dynamic> _msgs = [];
+  List<dynamic> _recent = [];
   bool _loading = false;
   bool _onlyOtp = false;
   String? _err;
@@ -286,6 +287,16 @@ class _InboxScreenState extends State<InboxScreen> {
     super.initState();
     appState.addListener(_reload);
     _reload();
+    _loadRecent();
+  }
+
+  Future<void> _loadRecent() async {
+    try {
+      final r = await api.history(limit: 20);
+      if (mounted && r is Map) {
+        setState(() => _recent = (r['items'] as List?) ?? []);
+      }
+    } catch (_) {}
   }
 
   @override
@@ -362,6 +373,32 @@ class _InboxScreenState extends State<InboxScreen> {
               onPressed: ref == null ? null : _deleteAll,
               icon: const Icon(Icons.delete_sweep_outlined)),
         ],
+        bottom: _recent.isEmpty
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(52),
+                child: SizedBox(
+                  height: 52,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 8),
+                    itemCount: _recent.length,
+                    separatorBuilder: (_, __) => const SizedBox(width: 8),
+                    itemBuilder: (ctx, i) {
+                      final it = _recent[i] as Map;
+                      final addr = (it['address'] ?? '').toString();
+                      final r = (it['ref'] ?? addr).toString();
+                      return ChoiceChip(
+                        label:
+                            Text(addr, style: const TextStyle(fontSize: 12)),
+                        selected: addr == appState.activeAddress,
+                        onSelected: (_) => appState.setActive(r, addr),
+                      );
+                    },
+                  ),
+                ),
+              ),
       ),
       body: ref == null
           ? const EmptyState(
