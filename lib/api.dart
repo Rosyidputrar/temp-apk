@@ -33,14 +33,6 @@ class TempmailApi {
   final HttpClient _http = HttpClient()
     ..connectionTimeout = const Duration(seconds: 20);
 
-  TempmailApi() {
-    // Lewat proxy bila lingkungan menyediakan (tidak wajib di HP).
-    final proxy = Platform.environment['https_proxy'];
-    if (proxy != null && proxy.isNotEmpty) {
-      // HttpClient bawaan mengabaikan env; biarkan langsung (HP user normal).
-    }
-  }
-
   Uri _u(String path, [Map<String, String?>? q]) {
     final clean = <String, String>{};
     q?.forEach((k, v) {
@@ -51,10 +43,105 @@ class TempmailApi {
   }
 
   Map<String, String> get _headers => {
-        'Authorization': 'Bearer $kApiToken',
-        'X-API-Key': kApiToken,
-        'Accept': 'application/json',
-      };
+    'Authorization': 'Bearer $kApiToken',
+    'X-API-Key': kApiToken,
+    'Accept': 'application/json',
+  };
+
+  /// Ubah galat jaringan mentah (SocketException dkk.) jadi pesan yang
+  /// bisa dibaca pengguna.
+  Future<T> _guard<T>(Future<T> Function() fn) async {
+    try {
+      return await fn();
+    } on ApiException {
+      rethrow;
+    } on TimeoutException {
+      throw ApiException(
+        0,
+        'TIMEOUT',
+        'Server terlalu lama merespons. Coba lagi.',
+      );
+    } on SocketException {
+      throw ApiException(
+        0,
+        'NETWORK',
+        'Tidak bisa terhubung ke server. Periksa koneksi internet.',
+      );
+    } on HandshakeException {
+      throw ApiException(
+        0,
+        'TLS',
+        'Koneksi aman ke server gagal (sertifikat/TLS).',
+      );
+    } on HttpException catch (e) {
+      throw ApiException(0, 'NETWORK', 'Koneksi terputus: ${e.message}');
+    }
+  }
+
+  /// Kirim permintaan dan kembalikan (status, JSON/teks hasil parse).
+  Future<(int, dynamic)> _send(
+    String method,
+    String path, {
+    Map<String, String?>? query,
+    Object? body,
+    String? rawBody,
+    ContentType? contentType,
+    Duration timeout = const Duration(seconds: 70),
+  }) => _guard(() async {
+    final req = await _http.openUrl(method, _u(path, query)).timeout(timeout);
+    _headers.forEach(req.headers.set);
+    if (rawBody != null) {
+      req.headers.contentType = contentType ?? ContentType.text;
+      req.write(rawBody);
+    } else if (body != null) {
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode(body));
+    }
+    final res = await req.close().timeout(timeout);
+    final text = await res.transform(utf8.decoder).join().timeout(timeout);
+    dynamic parsed;
+    try {
+      parsed = jsonDecode(text);
+    } catch (_) {
+      parsed = text;
+    }
+    return (res.statusCode, parsed);
+  });
+
+  /// Bongkar amplop standar {ok, data, meta} / {ok:false, error}.
+  ApiResult _unwrap(int status, dynamic parsed, [String? fallbackMsg]) {
+    if (parsed is Map && parsed['ok'] == true) {
+      return ApiResult(
+        parsed['data'],
+        (parsed['meta'] as Map?)?.cast<String, dynamic>() ?? {},
+      );
+    }
+    throw _error(status, parsed, fallbackMsg);
+  }
+
+  ApiException _error(int status, dynamic parsed, [String? fallbackMsg]) {
+    if (parsed is Map && parsed['error'] is Map) {
+      final e = parsed['error'] as Map;
+      return ApiException(
+        status,
+        e['code']?.toString() ?? 'ERROR',
+        e['message']?.toString() ?? fallbackMsg ?? 'Permintaan gagal ($status)',
+        e['details'],
+      );
+    }
+    if (status == 401 || status == 403) {
+      return ApiException(
+        status,
+        'UNAUTHORIZED',
+        'Token API ditolak server. Pastikan API_TOKEN benar saat build.',
+      );
+    }
+    return ApiException(
+      status,
+      'HTTP_$status',
+      fallbackMsg ?? 'Respons tak terduga ($status)',
+    );
+  }
 
   Future<ApiResult> call(
     String method,
@@ -63,54 +150,45 @@ class TempmailApi {
     Object? body,
     Duration timeout = const Duration(seconds: 70),
   }) async {
-    final req = await _http.openUrl(method, _u(path, query));
-    _headers.forEach(req.headers.set);
-    if (body != null) {
-      req.headers.contentType = ContentType.json;
-      req.write(jsonEncode(body));
-    }
-    final res = await req.close().timeout(timeout);
-    final text = await res.transform(utf8.decoder).join();
-    dynamic parsed;
-    try {
-      parsed = jsonDecode(text);
-    } catch (_) {
-      parsed = text;
-    }
-    if (parsed is Map && parsed['ok'] == true) {
-      return ApiResult(parsed['data'],
-          (parsed['meta'] as Map?)?.cast<String, dynamic>() ?? {});
-    }
-    if (parsed is Map && parsed['error'] is Map) {
-      final e = parsed['error'] as Map;
-      throw ApiException(
-        res.statusCode,
-        e['code']?.toString() ?? 'ERROR',
-        e['message']?.toString() ?? 'Permintaan gagal (${res.statusCode})',
-        e['details'],
-      );
-    }
-    throw ApiException(res.statusCode, 'HTTP_${res.statusCode}',
-        'Respons tak terduga (${res.statusCode})');
+    final (status, parsed) = await _send(
+      method,
+      path,
+      query: query,
+      body: body,
+      timeout: timeout,
+    );
+    return _unwrap(status, parsed);
   }
 
-  Future<dynamic> get(String path,
-          {Map<String, String?>? query, Duration? timeout}) async =>
-      (await call('GET', path, query: query,
-              timeout: timeout ?? const Duration(seconds: 70)))
-          .data;
+  Future<dynamic> get(
+    String path, {
+    Map<String, String?>? query,
+    Duration? timeout,
+  }) async => (await call(
+    'GET',
+    path,
+    query: query,
+    timeout: timeout ?? const Duration(seconds: 70),
+  )).data;
 
-  Future<dynamic> post(String path,
-          {Map<String, String?>? query,
-          Object? body,
-          Duration? timeout}) async =>
-      (await call('POST', path, query: query, body: body,
-              timeout: timeout ?? const Duration(seconds: 70)))
-          .data;
+  Future<dynamic> post(
+    String path, {
+    Map<String, String?>? query,
+    Object? body,
+    Duration? timeout,
+  }) async => (await call(
+    'POST',
+    path,
+    query: query,
+    body: body,
+    timeout: timeout ?? const Duration(seconds: 70),
+  )).data;
 
-  Future<dynamic> put(String path,
-          {Map<String, String?>? query, Object? body}) async =>
-      (await call('PUT', path, query: query, body: body)).data;
+  Future<dynamic> put(
+    String path, {
+    Map<String, String?>? query,
+    Object? body,
+  }) async => (await call('PUT', path, query: query, body: body)).data;
 
   Future<dynamic> patch(String path, {Object? body}) async =>
       (await call('PATCH', path, body: body)).data;
@@ -121,10 +199,20 @@ class TempmailApi {
   String enc(String ref) => Uri.encodeComponent(ref);
 
   // ---------- dasar ----------
+  /// Health lengkap (/v1/health: upstream + KV); jatuh ke /health polos
+  /// bila versi server belum punya.
   Future<dynamic> health() async {
-    final req = await _http.getUrl(Uri.parse('$kApiBase/health'));
-    final res = await req.close();
-    return jsonDecode(await res.transform(utf8.decoder).join());
+    try {
+      return await get('/v1/health', timeout: const Duration(seconds: 20));
+    } on ApiException catch (e) {
+      if (e.status == 0) rethrow;
+      final (_, parsed) = await _send(
+        'GET',
+        '/health',
+        timeout: const Duration(seconds: 20),
+      );
+      return parsed;
+    }
   }
 
   Future<dynamic> me() => get('/v1/me');
@@ -138,24 +226,34 @@ class TempmailApi {
     String? saveAs,
     List<String>? exclude,
     bool? randomAlias,
-  }) =>
-      post('/v1/mailbox', body: {
-        if (alias != null && alias.isNotEmpty) 'alias': alias,
-        if (domain != null && domain.isNotEmpty) 'domain': domain,
-        if (group != null && group.isNotEmpty) 'group': group,
-        if (check != null) 'check': check,
-        if (saveAs != null && saveAs.isNotEmpty) 'save_as': saveAs,
-        if (exclude != null && exclude.isNotEmpty) 'exclude': exclude,
-        if (randomAlias != null) 'random_alias': randomAlias,
-      });
+  }) => post(
+    '/v1/mailbox',
+    body: {
+      if (alias != null && alias.isNotEmpty) 'alias': alias,
+      if (domain != null && domain.isNotEmpty) 'domain': domain,
+      if (group != null && group.isNotEmpty) 'group': group,
+      'check': ?check,
+      if (saveAs != null && saveAs.isNotEmpty) 'save_as': saveAs,
+      if (exclude != null && exclude.isNotEmpty) 'exclude': exclude,
+      'random_alias': ?randomAlias,
+    },
+  );
 
-  Future<dynamic> quickCreate(String group,
-          {String? exclude, bool? randomAlias, String? saveAs}) =>
-      post('/v1/mailbox/quick/${enc(group)}', query: {
-        'exclude': exclude,
-        'random_alias': randomAlias == true ? '1' : null,
-        'save_as': saveAs,
-      });
+  /// Alamat acak per grup domain. [exclude] = alamat/alias yang tidak boleh
+  /// terpilih lagi (biasanya alamat aktif saat ini).
+  Future<dynamic> quickCreate(
+    String group, {
+    List<String>? exclude,
+    bool? randomAlias,
+    String? saveAs,
+  }) => post(
+    '/v1/mailbox/quick/${enc(group)}',
+    body: {
+      if (exclude != null && exclude.isNotEmpty) 'exclude': exclude,
+      'random_alias': ?randomAlias,
+      if (saveAs != null && saveAs.isNotEmpty) 'save_as': saveAs,
+    },
+  );
 
   Future<dynamic> mailboxInfo(String ref) => get('/v1/mailbox/${enc(ref)}');
 
@@ -171,23 +269,27 @@ class TempmailApi {
     bool text = false,
     bool html = false,
     bool? fresh,
-  }) =>
-      get('/v1/mailbox/${enc(ref)}/messages', query: {
-        'from': from,
-        'subject': subject,
-        'since': since,
-        'has_otp': hasOtp == true ? '1' : null,
-        'order': order,
-        'limit': limit?.toString(),
-        'offset': offset?.toString(),
-        'text': text ? '1' : null,
-        'html': html ? '1' : null,
-        'fresh': fresh == true ? '1' : null,
-      });
+  }) => get(
+    '/v1/mailbox/${enc(ref)}/messages',
+    query: {
+      'from': from,
+      'subject': subject,
+      'since': since,
+      'has_otp': hasOtp == true ? '1' : null,
+      'order': order,
+      'limit': limit?.toString(),
+      'offset': offset?.toString(),
+      'text': text ? '1' : null,
+      'html': html ? '1' : null,
+      'fresh': fresh == true ? '1' : null,
+    },
+  );
 
   Future<dynamic> messageDetail(String ref, String id, {bool html = true}) =>
-      get('/v1/mailbox/${enc(ref)}/messages/${enc(id)}',
-          query: {'html': html ? '1' : '0'});
+      get(
+        '/v1/mailbox/${enc(ref)}/messages/${enc(id)}',
+        query: {'html': html ? '1' : '0'},
+      );
 
   String rawMessageUrl(String ref, String id) =>
       '$kApiBase/v1/mailbox/${enc(ref)}/messages/${enc(id)}/raw';
@@ -195,12 +297,15 @@ class TempmailApi {
   Map<String, String> get authHeaders => _headers;
 
   Future<dynamic> latestMessage(String ref, {String? from, String? subject}) =>
-      get('/v1/mailbox/${enc(ref)}/latest',
-          query: {'from': from, 'subject': subject});
+      get(
+        '/v1/mailbox/${enc(ref)}/latest',
+        query: {'from': from, 'subject': subject},
+      );
 
-  Future<dynamic> links(String ref, {bool all = false, String? kind}) =>
-      get('/v1/mailbox/${enc(ref)}/links',
-          query: {'all': all ? '1' : null, 'kind': kind});
+  Future<dynamic> links(String ref, {bool all = false, String? kind}) => get(
+    '/v1/mailbox/${enc(ref)}/links',
+    query: {'all': all ? '1' : null, 'kind': kind},
+  );
 
   Future<dynamic> deleteMessage(String ref, String id) =>
       delete('/v1/mailbox/${enc(ref)}/messages/${enc(id)}');
@@ -211,14 +316,15 @@ class TempmailApi {
   Future<dynamic> deleteMailbox(String ref) =>
       delete('/v1/mailbox/${enc(ref)}', query: {'confirm': '1'});
 
-  Future<dynamic> markRead(String ref) =>
-      post('/v1/mailbox/${enc(ref)}/read');
+  Future<dynamic> markRead(String ref) => post('/v1/mailbox/${enc(ref)}/read');
 
   Future<dynamic> clearCache(String ref) =>
       delete('/v1/mailbox/${enc(ref)}/cache');
 
   // ---------- OTP & verifikasi ----------
-  Future<dynamic> otpLatest(String ref) => get('/v1/otp/${enc(ref)}/latest');
+  /// [fresh] = lewati cache server supaya email yang baru masuk ikut terbaca.
+  Future<dynamic> otpLatest(String ref, {bool fresh = true}) =>
+      get('/v1/otp/${enc(ref)}/latest', query: {'fresh': fresh ? '1' : null});
 
   Future<dynamic> otpWait(
     String ref, {
@@ -228,17 +334,18 @@ class TempmailApi {
     String? subject,
     int? length,
     bool includeExisting = false,
-  }) =>
-      get('/v1/otp/${enc(ref)}/wait',
-          query: {
-            'timeout': timeout.toString(),
-            'interval': interval?.toString(),
-            'from': from,
-            'subject': subject,
-            'length': length?.toString(),
-            'include_existing': includeExisting ? '1' : null,
-          },
-          timeout: Duration(seconds: timeout + 25));
+  }) => get(
+    '/v1/otp/${enc(ref)}/wait',
+    query: {
+      'timeout': timeout.toString(),
+      'interval': interval?.toString(),
+      'from': from,
+      'subject': subject,
+      'length': length?.toString(),
+      'include_existing': includeExisting ? '1' : null,
+    },
+    timeout: Duration(seconds: timeout + 25),
+  );
 
   Future<dynamic> otpWaitAny({
     required List<String> refs,
@@ -248,25 +355,39 @@ class TempmailApi {
     String? subject,
     int? length,
     bool includeExisting = false,
-  }) =>
-      post('/v1/otp/wait-any',
-          body: {
-            'refs': refs,
-            'timeout': timeout,
-            'mode': mode,
-            if (from != null) 'from': from,
-            if (subject != null) 'subject': subject,
-            if (length != null) 'length': length,
-            'include_existing': includeExisting,
-          },
-          timeout: Duration(seconds: timeout + 25));
+  }) => post(
+    '/v1/otp/wait-any',
+    body: {
+      'refs': refs,
+      'timeout': timeout,
+      'mode': mode,
+      'from': ?from,
+      'subject': ?subject,
+      'length': ?length,
+      'include_existing': includeExisting,
+    },
+    timeout: Duration(seconds: timeout + 25),
+  );
 
   /// SSE: GET /v1/otp/{ref}/stream — event: ready/message/otp/ping/timeout
   Stream<Map<String, dynamic>> otpStream(String ref) async* {
     final uri = _u('/v1/otp/${enc(ref)}/stream', {'token': kApiToken});
-    final req = await _http.getUrl(uri);
-    _headers.forEach(req.headers.set);
-    final res = await req.close();
+    final res = await _guard(() async {
+      final req = await _http.getUrl(uri);
+      _headers.forEach(req.headers.set);
+      req.headers.set('Accept', 'text/event-stream');
+      return req.close();
+    });
+    if (res.statusCode >= 400) {
+      final text = await res.transform(utf8.decoder).join();
+      dynamic parsed;
+      try {
+        parsed = jsonDecode(text);
+      } catch (_) {
+        parsed = text;
+      }
+      throw _error(res.statusCode, parsed, 'Stream ditolak server');
+    }
     var event = 'message';
     await for (final line
         in res.transform(utf8.decoder).transform(const LineSplitter())) {
@@ -289,48 +410,53 @@ class TempmailApi {
     }
   }
 
-  Future<dynamic> otpHistory(String ref) =>
-      get('/v1/otp/${enc(ref)}/history');
+  Future<dynamic> otpHistory(String ref) => get('/v1/otp/${enc(ref)}/history');
 
   Future<dynamic> clearOtpHistory(String ref) =>
       delete('/v1/otp/${enc(ref)}/history');
 
   Future<dynamic> otpExtract(String text, {dynamic patterns}) =>
-      post('/v1/otp/extract', body: {
-        'text': text,
-        if (patterns != null) 'patterns': patterns,
-      });
+      post('/v1/otp/extract', body: {'text': text, 'patterns': ?patterns});
 
   Future<dynamic> verifyLatest(String ref) =>
       get('/v1/verify/${enc(ref)}/latest');
 
-  Future<dynamic> verifyWait(String ref, {int timeout = 50}) =>
-      get('/v1/verify/${enc(ref)}/wait',
-          query: {'timeout': timeout.toString()},
-          timeout: Duration(seconds: timeout + 25));
+  Future<dynamic> verifyWait(String ref, {int timeout = 50}) => get(
+    '/v1/verify/${enc(ref)}/wait',
+    query: {'timeout': timeout.toString()},
+    timeout: Duration(seconds: timeout + 25),
+  );
 
   // ---------- favorit ----------
   Future<dynamic> favorites() => get('/v1/favorites');
 
-  Future<dynamic> addFavorite(String address,
-          {String? label, String? note, bool? pinned}) =>
-      post('/v1/favorites', body: {
-        'address': address,
-        if (label != null) 'label': label,
-        if (note != null) 'note': note,
-        if (pinned != null) 'pinned': pinned,
-      });
+  Future<dynamic> addFavorite(
+    String address, {
+    String? label,
+    String? note,
+    bool? pinned,
+  }) => post(
+    '/v1/favorites',
+    body: {
+      'address': address,
+      'label': ?label,
+      'note': ?note,
+      'pinned': ?pinned,
+    },
+  );
 
   Future<dynamic> favoriteOne(String address) =>
       get('/v1/favorites/${enc(address)}');
 
-  Future<dynamic> patchFavorite(String address,
-          {String? label, String? note, bool? pinned}) =>
-      patch('/v1/favorites/${enc(address)}', body: {
-        if (label != null) 'label': label,
-        if (note != null) 'note': note,
-        if (pinned != null) 'pinned': pinned,
-      });
+  Future<dynamic> patchFavorite(
+    String address, {
+    String? label,
+    String? note,
+    bool? pinned,
+  }) => patch(
+    '/v1/favorites/${enc(address)}',
+    body: {'label': ?label, 'note': ?note, 'pinned': ?pinned},
+  );
 
   Future<dynamic> removeFavorite(String address) =>
       delete('/v1/favorites/${enc(address)}');
@@ -342,26 +468,10 @@ class TempmailApi {
 
   /// GET yang mengembalikan JSON apa adanya (untuk endpoint di luar
   /// amplop {ok,data} standar, mis. ekspor favorit {version,items}).
-  Future<dynamic> rawGet(String path,
-      {Map<String, String?>? query}) async {
-    final req = await _http.openUrl('GET', _u(path, query));
-    _headers.forEach(req.headers.set);
-    final res = await req.close();
-    final text = await res.transform(utf8.decoder).join();
-    dynamic parsed;
-    try {
-      parsed = jsonDecode(text);
-    } catch (_) {
-      parsed = text;
-    }
-    if (parsed is Map && parsed['error'] is Map) {
-      final e = parsed['error'] as Map;
-      throw ApiException(res.statusCode, e['code']?.toString() ?? 'ERROR',
-          e['message']?.toString() ?? 'Permintaan gagal');
-    }
-    if (res.statusCode >= 400) {
-      throw ApiException(
-          res.statusCode, 'HTTP_${res.statusCode}', 'Respons tak terduga');
+  Future<dynamic> rawGet(String path, {Map<String, String?>? query}) async {
+    final (status, parsed) = await _send('GET', path, query: query);
+    if ((parsed is Map && parsed['error'] is Map) || status >= 400) {
+      throw _error(status, parsed, 'Permintaan gagal');
     }
     return parsed;
   }
@@ -370,22 +480,26 @@ class TempmailApi {
       post('/v1/favorites/import', body: {'items': items});
 
   // ---------- varian & gmail ----------
-  Future<dynamic> variants(String ref,
-          {String mode = 'both', int? count, String? tag}) =>
-      get('/v1/variants/${enc(ref)}', query: {
-        'mode': mode,
-        'count': count?.toString(),
-        'tag': tag,
-      });
+  Future<dynamic> variants(
+    String ref, {
+    String mode = 'both',
+    int? count,
+    String? tag,
+  }) => get(
+    '/v1/variants/${enc(ref)}',
+    query: {'mode': mode, 'count': count?.toString(), 'tag': tag},
+  );
 
-  Future<dynamic> variantCreate(String ref,
-          {required String mode, String? tag, List<String>? exclude, String? saveAs}) =>
-      post('/v1/mailbox/variant/${enc(ref)}', body: {
-        'mode': mode,
-        if (tag != null) 'tag': tag,
-        if (exclude != null) 'exclude': exclude,
-        if (saveAs != null) 'save_as': saveAs,
-      });
+  Future<dynamic> variantCreate(
+    String ref, {
+    required String mode,
+    String? tag,
+    List<String>? exclude,
+    String? saveAs,
+  }) => post(
+    '/v1/mailbox/variant/${enc(ref)}',
+    body: {'mode': mode, 'tag': ?tag, 'exclude': ?exclude, 'save_as': ?saveAs},
+  );
 
   Future<dynamic> gmailVariants({
     required String email,
@@ -397,56 +511,53 @@ class TempmailApi {
     String? prefix,
     String? tags,
     String? q,
-  }) =>
-      get('/v1/gmail/variants', query: {
-        'email': email,
-        'mode': mode,
-        'order': order,
-        'dots': dots?.toString(),
-        'offset': offset?.toString(),
-        'limit': limit?.toString(),
-        'prefix': prefix,
-        'tags': tags,
-        'q': q,
-      });
+  }) => get(
+    '/v1/gmail/variants',
+    query: {
+      'email': email,
+      'mode': mode,
+      'order': order,
+      'dots': dots?.toString(),
+      'offset': offset?.toString(),
+      'limit': limit?.toString(),
+      'prefix': prefix,
+      'tags': tags,
+      'q': q,
+    },
+  );
 
   // ---------- alias.md ----------
   Future<dynamic> aliasGet() => get('/v1/alias');
 
-  Future<ApiResult> aliasPutRaw(String markdown,
-      {String? domain, String? group}) async {
-    final req = await _http.putUrl(_u('/v1/alias', {
-      'domain': domain,
-      'group': group,
-    }));
-    _headers.forEach(req.headers.set);
-    req.headers.contentType = ContentType('text', 'markdown');
-    req.write(markdown);
-    final res = await req.close();
-    final text = await res.transform(utf8.decoder).join();
-    final parsed = jsonDecode(text);
-    if (parsed is Map && parsed['ok'] == true) {
-      return ApiResult(parsed['data'],
-          (parsed['meta'] as Map?)?.cast<String, dynamic>() ?? {});
-    }
-    final e = (parsed as Map)['error'] as Map;
-    throw ApiException(res.statusCode, e['code']?.toString() ?? 'ERROR',
-        e['message']?.toString() ?? 'Gagal menyimpan alias');
+  Future<ApiResult> aliasPutRaw(
+    String markdown, {
+    String? domain,
+    String? group,
+  }) async {
+    final (status, parsed) = await _send(
+      'PUT',
+      '/v1/alias',
+      query: {'domain': domain, 'group': group},
+      rawBody: markdown,
+      contentType: ContentType('text', 'markdown', charset: 'utf-8'),
+    );
+    return _unwrap(status, parsed, 'Gagal menyimpan alias');
   }
 
-  Future<dynamic> aliasValidate(String markdown) async {
-    final req = await _http.postUrl(_u('/v1/alias/validate'));
-    _headers.forEach(req.headers.set);
-    req.headers.contentType = ContentType('text', 'markdown');
-    req.write(markdown);
-    final res = await req.close();
-    final text = await res.transform(utf8.decoder).join();
-    final parsed = jsonDecode(text);
-    if (parsed is Map && parsed['ok'] == true) return parsed['data'];
-    final e = (parsed as Map)['error'] as Map;
-    throw ApiException(res.statusCode, e['code']?.toString() ?? 'ERROR',
-        e['message']?.toString() ?? 'Validasi gagal');
-    }
+  Future<dynamic> aliasValidate(
+    String markdown, {
+    String? domain,
+    String? group,
+  }) async {
+    final (status, parsed) = await _send(
+      'POST',
+      '/v1/alias/validate',
+      query: {'domain': domain, 'group': group},
+      rawBody: markdown,
+      contentType: ContentType('text', 'markdown', charset: 'utf-8'),
+    );
+    return _unwrap(status, parsed, 'Validasi gagal').data;
+  }
 
   Future<dynamic> aliasDelete() => delete('/v1/alias');
 
@@ -459,12 +570,20 @@ class TempmailApi {
       delete('/v1/alias/${enc(name)}');
 
   // ---------- domain ----------
-  Future<dynamic> domains({String? q, String? group, int? page}) =>
-      get('/v1/domains', query: {
-        'q': q,
-        'group': group,
-        'page': page?.toString(),
-      });
+  Future<dynamic> domains({
+    String? q,
+    String? group,
+    int? page,
+    int? perPage,
+  }) => get(
+    '/v1/domains',
+    query: {
+      'q': q,
+      'group': group,
+      'page': page?.toString(),
+      'per_page': perPage?.toString(),
+    },
+  );
 
   Future<dynamic> domainRandom({String? group}) =>
       get('/v1/domains/random', query: {'group': group});
@@ -475,8 +594,8 @@ class TempmailApi {
       get('/v1/domains/check', query: {'domain': domain});
 
   // ---------- riwayat ----------
-  Future<dynamic> history({int? limit, String? q}) => get('/v1/history',
-      query: {'limit': limit?.toString(), 'q': q});
+  Future<dynamic> history({int? limit, String? q}) =>
+      get('/v1/history', query: {'limit': limit?.toString(), 'q': q});
 
   Future<dynamic> historyEvents({
     String? type,
@@ -486,16 +605,18 @@ class TempmailApi {
     int? limit,
     int? offset,
     String? format,
-  }) =>
-      get('/v1/history/events', query: {
-        'type': type,
-        'ref': ref,
-        'hours': hours?.toString(),
-        'q': q,
-        'limit': limit?.toString(),
-        'offset': offset?.toString(),
-        'format': format,
-      });
+  }) => get(
+    '/v1/history/events',
+    query: {
+      'type': type,
+      'ref': ref,
+      'hours': hours?.toString(),
+      'q': q,
+      'limit': limit?.toString(),
+      'offset': offset?.toString(),
+      'format': format,
+    },
+  );
 
   Future<dynamic> deleteRecent(String address) =>
       delete('/v1/history/recent/${enc(address)}');
@@ -516,18 +637,20 @@ class TempmailApi {
     bool? once,
     bool? includeExisting,
     dynamic notify,
-  }) =>
-      post('/v1/watch', body: {
-        'ref': ref,
-        if (mode != null) 'mode': mode,
-        if (from != null) 'from': from,
-        if (subject != null) 'subject': subject,
-        if (length != null) 'length': length,
-        if (ttlMinutes != null) 'ttl_minutes': ttlMinutes,
-        if (once != null) 'once': once,
-        if (includeExisting != null) 'include_existing': includeExisting,
-        if (notify != null) 'notify': notify,
-      });
+  }) => post(
+    '/v1/watch',
+    body: {
+      'ref': ref,
+      'mode': ?mode,
+      'from': ?from,
+      'subject': ?subject,
+      'length': ?length,
+      'ttl_minutes': ?ttlMinutes,
+      'once': ?once,
+      'include_existing': ?includeExisting,
+      'notify': ?notify,
+    },
+  );
 
   Future<dynamic> watchRun() => post('/v1/watch/run');
 
@@ -538,14 +661,13 @@ class TempmailApi {
 
   // ---------- debug & admin ----------
   Future<dynamic> debugRef(String ref, {String? mid, bool inbox = false}) =>
-      get('/v1/debug/${enc(ref)}', query: {
-        'mid': mid,
-        'inbox': inbox ? '1' : null,
-      });
+      get(
+        '/v1/debug/${enc(ref)}',
+        query: {'mid': mid, 'inbox': inbox ? '1' : null},
+      );
 
   Future<dynamic> adminLogs({int limit = 100, String? level}) =>
-      get('/v1/admin/logs',
-          query: {'limit': limit.toString(), 'level': level});
+      get('/v1/admin/logs', query: {'limit': limit.toString(), 'level': level});
 
   Future<dynamic> adminClearLogs() => delete('/v1/admin/logs');
 
@@ -565,8 +687,7 @@ class TempmailApi {
   Future<dynamic> adminPutOtpPatterns(dynamic patterns) =>
       put('/v1/admin/otp-patterns', body: {'patterns': patterns});
 
-  Future<dynamic> adminDeleteOtpPatterns() =>
-      delete('/v1/admin/otp-patterns');
+  Future<dynamic> adminDeleteOtpPatterns() => delete('/v1/admin/otp-patterns');
 
   void close() => _http.close(force: true);
 }

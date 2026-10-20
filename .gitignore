@@ -5,3 +5,6 @@ android/key.properties
 android/local.properties
 *.iml
 .idea/
+android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
+android/.gradle/
+android/tempmail-release.keystore

@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'api.dart';
@@ -42,8 +43,9 @@ class AppState extends ChangeNotifier {
       if (activeRef == null) {
         if (await f.exists()) await f.delete();
       } else {
-        await f.writeAsString(jsonEncode(
-            {'ref': activeRef, 'address': activeAddress}));
+        await f.writeAsString(
+          jsonEncode({'ref': activeRef, 'address': activeAddress}),
+        );
       }
     } catch (_) {}
   }
@@ -65,13 +67,25 @@ class AppState extends ChangeNotifier {
 
 final appState = AppState();
 
+/// Tab bawah yang sedang tampil. Layar di dalam IndexedStack tetap hidup
+/// walau tidak terlihat, jadi mereka memakai ini untuk tahu kapan perlu
+/// memuat ulang (Favorit) atau menghentikan auto-refresh (Inbox).
+final currentTab = ValueNotifier<int>(0);
+
+const int kTabHome = 0;
+const int kTabInbox = 1;
+const int kTabOtp = 2;
+const int kTabFavorites = 3;
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // JANGAN await apa pun sebelum runApp: frame pertama harus digambar dulu.
   // (Await SharedPreferences di sini pernah bikin layar hitam permanen.)
   // ignore: unawaited_futures
-  appState.load().timeout(const Duration(seconds: 5),
-      onTimeout: () {}).catchError((_) {});
+  appState
+      .load()
+      .timeout(const Duration(seconds: 5), onTimeout: () {})
+      .catchError((_) {});
   ErrorWidget.builder = (details) {
     return const Material(
       color: Colors.white,
@@ -111,58 +125,59 @@ class TempMailApp extends StatelessWidget {
       brightness: Brightness.dark,
     );
     ThemeData theme(ColorScheme s) => ThemeData(
-          useMaterial3: true,
-          colorScheme: s,
-          scaffoldBackgroundColor: s.surface,
-          appBarTheme: AppBarTheme(
-            backgroundColor: s.surface,
-            surfaceTintColor: Colors.transparent,
-            elevation: 0,
-            titleTextStyle: TextStyle(
-              color: s.onSurface,
-              fontSize: 20,
-              fontWeight: FontWeight.w700,
-            ),
+      useMaterial3: true,
+      colorScheme: s,
+      scaffoldBackgroundColor: s.surface,
+      appBarTheme: AppBarTheme(
+        backgroundColor: s.surface,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        titleTextStyle: TextStyle(
+          color: s.onSurface,
+          fontSize: 20,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+      cardTheme: CardThemeData(
+        elevation: 0,
+        color: s.surfaceContainerLow,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(color: s.outlineVariant),
+        ),
+      ),
+      filledButtonTheme: FilledButtonThemeData(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size(48, 48),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
           ),
-          cardTheme: CardThemeData(
-            elevation: 0,
-            color: s.surfaceContainerLow,
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(16),
-              side: BorderSide(color: s.outlineVariant),
-            ),
+        ),
+      ),
+      outlinedButtonTheme: OutlinedButtonThemeData(
+        style: OutlinedButton.styleFrom(
+          minimumSize: const Size(48, 44),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
           ),
-          filledButtonTheme: FilledButtonThemeData(
-            style: FilledButton.styleFrom(
-              minimumSize: const Size(48, 48),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
-          outlinedButtonTheme: OutlinedButtonThemeData(
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size(48, 44),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
-          inputDecorationTheme: InputDecorationTheme(
-            border: OutlineInputBorder(
-                borderRadius: BorderRadius.circular(12)),
-            filled: true,
-            fillColor: s.surfaceContainerLowest,
-          ),
-          navigationBarTheme: NavigationBarThemeData(
-            height: 64,
-            labelTextStyle: WidgetStatePropertyAll(
-                TextStyle(fontSize: 12, color: s.onSurface)),
-          ),
-          snackBarTheme: SnackBarThemeData(
-            behavior: SnackBarBehavior.floating,
-            shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12)),
-          ),
-        );
+        ),
+      ),
+      inputDecorationTheme: InputDecorationTheme(
+        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        filled: true,
+        fillColor: s.surfaceContainerLowest,
+      ),
+      navigationBarTheme: NavigationBarThemeData(
+        height: 64,
+        labelTextStyle: WidgetStatePropertyAll(
+          TextStyle(fontSize: 12, color: s.onSurface),
+        ),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      ),
+    );
     return MaterialApp(
       title: 'TempMail',
       debugShowCheckedModeBanner: false,
@@ -181,61 +196,134 @@ class Shell extends StatefulWidget {
 }
 
 class _ShellState extends State<Shell> {
-  int _tab = 0;
+  static const _pages = [
+    HomeScreen(),
+    InboxScreen(),
+    OtpScreen(),
+    FavoritesScreen(),
+    MoreScreen(),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    currentTab.addListener(_onTab);
+  }
+
+  @override
+  void dispose() {
+    currentTab.removeListener(_onTab);
+    super.dispose();
+  }
+
+  void _onTab() {
+    if (mounted) setState(() {});
+  }
 
   @override
   Widget build(BuildContext context) {
-    final pages = [
-      const HomeScreen(),
-      const InboxScreen(),
-      const OtpScreen(),
-      const FavoritesScreen(),
-      const MoreScreen(),
-    ];
-    return Scaffold(
-      body: IndexedStack(index: _tab, children: pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
-        destinations: const [
-          NavigationDestination(
+    final tab = currentTab.value;
+    return PopScope(
+      // Tombol kembali di tab selain Beranda: pulang ke Beranda dulu,
+      // bukan langsung keluar aplikasi.
+      canPop: tab == kTabHome,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) currentTab.value = kTabHome;
+      },
+      child: Scaffold(
+        body: IndexedStack(index: tab, children: _pages),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: tab,
+          onDestinationSelected: (i) => currentTab.value = i,
+          destinations: const [
+            NavigationDestination(
               icon: Icon(Icons.home_outlined),
               selectedIcon: Icon(Icons.home),
-              label: 'Beranda'),
-          NavigationDestination(
+              label: 'Beranda',
+            ),
+            NavigationDestination(
               icon: Icon(Icons.inbox_outlined),
               selectedIcon: Icon(Icons.inbox),
-              label: 'Inbox'),
-          NavigationDestination(
+              label: 'Inbox',
+            ),
+            NavigationDestination(
               icon: Icon(Icons.pin_outlined),
               selectedIcon: Icon(Icons.pin),
-              label: 'OTP'),
-          NavigationDestination(
+              label: 'OTP',
+            ),
+            NavigationDestination(
               icon: Icon(Icons.star_outline),
               selectedIcon: Icon(Icons.star),
-              label: 'Favorit'),
-          NavigationDestination(
+              label: 'Favorit',
+            ),
+            NavigationDestination(
               icon: Icon(Icons.grid_view_outlined),
               selectedIcon: Icon(Icons.grid_view),
-              label: 'Menu'),
-        ],
+              label: 'Menu',
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
 // ---------- util bersama ----------
+String errorText(Object e) {
+  if (e is ApiException) return e.message;
+  if (e is FormatException) return 'Format JSON tidak valid: ${e.message}';
+  if (e is TypeError) return 'Data tidak sesuai format yang diharapkan.';
+  return e.toString();
+}
+
 void showError(BuildContext context, Object e) {
-  final msg = e is ApiException ? e.message : e.toString();
-  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-    content: Text(msg),
-    backgroundColor: Theme.of(context).colorScheme.error,
-  ));
+  final s = Theme.of(context).colorScheme;
+  ScaffoldMessenger.of(context)
+    ..hideCurrentSnackBar()
+    ..showSnackBar(
+      SnackBar(
+        content: Text(errorText(e), style: TextStyle(color: s.onError)),
+        backgroundColor: s.error,
+      ),
+    );
 }
 
 void showOk(BuildContext context, String msg) {
   ScaffoldMessenger.of(context)
-      .showSnackBar(SnackBar(content: Text(msg)));
+    ..hideCurrentSnackBar()
+    ..showSnackBar(SnackBar(content: Text(msg)));
+}
+
+/// Salin ke clipboard + beri tahu pengguna.
+Future<void> copyText(
+  BuildContext context,
+  String text, [
+  String msg = 'Disalin',
+]) async {
+  await Clipboard.setData(ClipboardData(text: text));
+  if (context.mounted) showOk(context, msg);
+}
+
+/// Ambil daftar dari respons API yang bentuknya bisa List langsung atau
+/// Map berisi salah satu [keys].
+List<dynamic> listOf(dynamic r, [List<String> keys = const ['items']]) {
+  if (r is List) return r;
+  if (r is Map) {
+    for (final k in keys) {
+      if (r[k] is List) return r[k] as List;
+    }
+  }
+  return const [];
+}
+
+/// "12 dtk lalu" / "5 mnt lalu" dari jumlah detik.
+String agoText(dynamic seconds) {
+  final s = seconds is num ? seconds.round() : int.tryParse('$seconds');
+  if (s == null) return '';
+  if (s < 45) return 'baru saja';
+  if (s < 3600) return '${(s / 60).round().clamp(1, 59)} mnt lalu';
+  if (s < 86400) return '${(s / 3600).round()} jam lalu';
+  return '${(s / 86400).round()} hr lalu';
 }
 
 Future<bool> confirmDialog(
@@ -251,11 +339,13 @@ Future<bool> confirmDialog(
       content: Text(body),
       actions: [
         TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Batal')),
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Batal'),
+        ),
         FilledButton(
           style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error),
+            backgroundColor: Theme.of(ctx).colorScheme.error,
+          ),
           onPressed: () => Navigator.pop(ctx, true),
           child: Text(confirmLabel),
         ),
@@ -299,8 +389,12 @@ class EmptyState extends StatelessWidget {
   final IconData icon;
   final String title;
   final String? subtitle;
-  const EmptyState(
-      {super.key, required this.icon, required this.title, this.subtitle});
+  const EmptyState({
+    super.key,
+    required this.icon,
+    required this.title,
+    this.subtitle,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -313,15 +407,18 @@ class EmptyState extends StatelessWidget {
           children: [
             Icon(icon, size: 56, color: s.outline),
             const SizedBox(height: 12),
-            Text(title,
-                style:
-                    const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
-                textAlign: TextAlign.center),
+            Text(
+              title,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              textAlign: TextAlign.center,
+            ),
             if (subtitle != null) ...[
               const SizedBox(height: 6),
-              Text(subtitle!,
-                  style: TextStyle(color: s.onSurfaceVariant),
-                  textAlign: TextAlign.center),
+              Text(
+                subtitle!,
+                style: TextStyle(color: s.onSurfaceVariant),
+                textAlign: TextAlign.center,
+              ),
             ],
           ],
         ),
