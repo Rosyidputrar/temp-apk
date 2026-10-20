@@ -63,6 +63,21 @@ void main() {
     expect(find.text('TempMail'), findsWidgets);
     expect(find.text('Buat cepat'), findsOneWidget);
 
+    // Beranda bisa di-refresh: tombol di AppBar + tarik ke bawah.
+    expect(find.byTooltip('Muat ulang'), findsOneWidget);
+    await tester.tap(find.byTooltip('Muat ulang'));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 200)),
+    );
+    await tester.pump(const Duration(milliseconds: 100));
+    await tester.fling(find.text('Buat cepat'), const Offset(0, 400), 1000);
+    await tester.pump(const Duration(seconds: 1));
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 200)),
+    );
+    await tester.pump(const Duration(seconds: 1));
+    expect(find.byType(RefreshIndicator), findsWidgets);
+
     // Tab OTP tanpa alamat aktif.
     await tester.tap(find.text('OTP').last);
     await tester.pump(const Duration(milliseconds: 100));
