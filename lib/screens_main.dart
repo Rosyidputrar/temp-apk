@@ -151,7 +151,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       Padding(
                         padding: const EdgeInsets.only(top: 6),
                         child: Text(
-                          'Pesan: ${_info['total'] ?? _info['count'] ?? '-'}'
+                          'Pesan: ${_info['message_count'] ?? _info['total'] ?? _info['count'] ?? '-'}'
                           '  •  ref: ${appState.activeRef}',
                           style: TextStyle(color: s.onSurfaceVariant),
                         ),
