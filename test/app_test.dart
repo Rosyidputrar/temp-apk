@@ -50,6 +50,21 @@ void main() {
       expect(listOf('x'), isEmpty);
     });
 
+    test('quickGroupCounts cocokkan nama grup secara longgar', () {
+      final c = quickGroupCounts(
+        {
+          'groups': [
+            {'name': 'Premium ', 'count': 23},
+            {'name': 'basic', 'count': 105},
+            {'name': 'standard', 'count': '75'},
+          ],
+        },
+        ['premium', 'basic', 'standard', 'semua'],
+      );
+      expect(c, {'premium': 23, 'basic': 105, 'standard': 75, 'semua': 203});
+      expect(quickGroupCounts(null, ['premium']), isEmpty);
+    });
+
     test('msgTimeShort pakai umur pesan bila ada', () {
       expect(msgTimeShort({'age_seconds': 300}), '5 mnt lalu');
       expect(msgTimeShort({}), '');

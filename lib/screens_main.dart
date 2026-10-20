@@ -80,6 +80,33 @@ String _str(dynamic v, [String fallback = '']) {
   return s.trim().isEmpty ? fallback : s;
 }
 
+/// Jumlah domain per tombol "Buat cepat" dari respons /v1/domains/groups.
+/// Nama grup dari server bisa beda huruf besar/spasi ("Premium ",
+/// "premium-domains", ...), jadi dicocokkan longgar. `semua` = total.
+Map<String, int> quickGroupCounts(dynamic r, List<String> quick) {
+  final counts = <String, int>{};
+  var total = 0;
+  for (final g in listOf(r, ['groups', 'items'])) {
+    if (g is! Map) continue;
+    final raw = g['count'];
+    final c = raw is num ? raw.toInt() : int.tryParse('$raw') ?? 0;
+    total += c;
+    final names = [
+      g['name'],
+      g['key'],
+      g['id'],
+      g['slug'],
+    ].where((v) => v != null).map((v) => v.toString().trim().toLowerCase());
+    for (final q in quick) {
+      if (q != 'semua' && names.any((n) => n == q || n.startsWith(q))) {
+        counts[q] = (counts[q] ?? 0) + c;
+      }
+    }
+  }
+  if (total > 0) counts['semua'] = total;
+  return counts;
+}
+
 // ============================ BERANDA ============================
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -172,16 +199,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _loadGroupCounts() async {
     try {
       final r = await api.domainGroups();
-      final counts = <String, int>{};
-      var total = 0;
-      for (final g in listOf(r, ['groups', 'items'])) {
-        if (g is Map && g['name'] != null) {
-          final c = (g['count'] as num?)?.toInt() ?? 0;
-          counts[g['name'].toString()] = c;
-          total += c;
-        }
-      }
-      if (total > 0) counts['semua'] = counts['semua'] ?? total;
+      final counts = quickGroupCounts(r, _quickGroups);
       if (mounted) setState(() => _groupCounts = counts);
     } catch (_) {}
   }
