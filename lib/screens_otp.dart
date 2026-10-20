@@ -16,8 +16,15 @@ class OtpScreen extends StatefulWidget {
 
 class _OtpScreenState extends State<OtpScreen> {
   dynamic _latest;
+  String? _latestEmpty; // pesan ramah bila belum ada OTP
+  bool _loadingLatest = false;
+  int _refGen = 0; // naik saat alamat berganti → request alamat lama diabaikan
   dynamic _waitResult;
+  bool _waitStale = false;
   bool _waiting = false;
+  int _waitGen = 0; // naik saat "Batal" → hasil tunggu lama diabaikan
+  int _waitSecs = 0;
+  Timer? _waitTick;
   final _timeoutCtl = TextEditingController(text: '50');
   final _refsCtl = TextEditingController();
   dynamic _waitAnyResult;
@@ -35,22 +42,110 @@ class _OtpScreenState extends State<OtpScreen> {
   dynamic _verifyWait;
   bool _verifyWaiting = false;
 
+  String? _shownRef;
+
+  @override
+  void initState() {
+    super.initState();
+    _shownRef = appState.activeRef;
+    appState.addListener(_onState);
+    currentTab.addListener(_onTab);
+  }
+
+  // Buka tab OTP → langsung tampilkan OTP terbaru (sekali per alamat).
+  void _onTab() {
+    if (currentTab.value == kTabOtp &&
+        _ref != null &&
+        _latest == null &&
+        _latestEmpty == null &&
+        !_loadingLatest) {
+      _loadLatest();
+    }
+  }
+
   @override
   void dispose() {
+    appState.removeListener(_onState);
+    currentTab.removeListener(_onTab);
     _sub?.cancel();
+    _waitTick?.cancel();
+    _timeoutCtl.dispose();
+    _refsCtl.dispose();
+    _extractCtl.dispose();
     super.dispose();
+  }
+
+  /// Alamat aktif berganti → buang hasil milik alamat lama.
+  void _onState() {
+    if (!mounted) return;
+    if (appState.activeRef != _shownRef) {
+      _sub?.cancel();
+      _sub = null;
+      _stopWaitTick();
+      _waitGen++;
+      _refGen++;
+      setState(() {
+        _shownRef = appState.activeRef;
+        _loadingLatest = false;
+        _latest = null;
+        _latestEmpty = null;
+        _waitResult = null;
+        _waiting = false;
+        _streaming = false;
+        _streamLog.clear();
+        _history = null;
+        _verifyLatest = null;
+        _verifyWait = null;
+        _verifyWaiting = false;
+      });
+    } else {
+      setState(() {});
+    }
   }
 
   String? get _ref => appState.activeRef;
 
+  int get _timeout =>
+      (int.tryParse(_timeoutCtl.text.trim()) ?? 50).clamp(5, 280);
+
+  void _stopWaitTick() {
+    _waitTick?.cancel();
+    _waitTick = null;
+  }
+
+  Future<void> _autoCopy(String code) async {
+    await Clipboard.setData(ClipboardData(text: code));
+    HapticFeedback.mediumImpact();
+    if (mounted) showOk(context, 'OTP $code disalin otomatis');
+  }
+
   Future<void> _loadLatest() async {
     final ref = _ref;
     if (ref == null) return;
+    final gen = _refGen;
+    setState(() => _loadingLatest = true);
     try {
       final r = await api.otpLatest(ref);
-      if (mounted) setState(() => _latest = r);
+      if (mounted && gen == _refGen) {
+        setState(() {
+          _latest = r;
+          _latestEmpty = null;
+        });
+      }
+    } on ApiException catch (e) {
+      if (!mounted || gen != _refGen) return;
+      if (e.code == 'NO_OTP' || e.status == 404) {
+        setState(() {
+          _latest = null;
+          _latestEmpty = 'Belum ada email berisi OTP. Kirim ke alamat ini lalu tekan "Tunggu OTP".';
+        });
+      } else {
+        showError(context, e);
+      }
     } catch (e) {
-      if (mounted) showError(context, e);
+      if (mounted && gen == _refGen) showError(context, e);
+    } finally {
+      if (mounted && gen == _refGen) setState(() => _loadingLatest = false);
     }
   }
 
@@ -59,43 +154,98 @@ class _OtpScreenState extends State<OtpScreen> {
     if (ref == null) return;
     try {
       final r = await api.otpHistory(ref);
-      if (mounted) setState(() => _history = r);
+      if (mounted && ref == _ref) setState(() => _history = r);
+    } catch (e) {
+      if (mounted) showError(context, e);
+    }
+  }
+
+  Future<void> _clearHistory() async {
+    final ref = _ref;
+    if (ref == null) return;
+    final ok = await confirmDialog(
+      context,
+      title: 'Bersihkan riwayat OTP?',
+      body: 'Riwayat OTP alamat ini dihapus.',
+    );
+    if (!ok) return;
+    try {
+      await api.clearOtpHistory(ref);
+      if (mounted) {
+        setState(() => _history = null);
+        showOk(context, 'Riwayat OTP dibersihkan');
+      }
     } catch (e) {
       if (mounted) showError(context, e);
     }
   }
 
   Future<void> _wait() async {
+    if (_waiting) {
+      // Batal: request HTTP tetap jalan di belakang, hasilnya diabaikan.
+      _waitGen++;
+      _stopWaitTick();
+      setState(() => _waiting = false);
+      showOk(context, 'Menunggu dibatalkan');
+      return;
+    }
     final ref = _ref;
     if (ref == null) return;
+    final gen = ++_waitGen;
     setState(() {
       _waiting = true;
       _waitResult = null;
+      _waitStale = false;
+      _waitSecs = 0;
+    });
+    _waitTick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _waitSecs++);
     });
     try {
-      final t = int.tryParse(_timeoutCtl.text) ?? 50;
-      final r = await api.otpWait(ref, timeout: t.clamp(5, 280));
-      if (mounted) setState(() => _waitResult = r);
+      final r = await api.otpWait(ref, timeout: _timeout);
+      if (!mounted || gen != _waitGen) return;
+      setState(() => _waitResult = r);
+      final code = r is Map ? r['otp']?.toString() : null;
+      if (code != null && code.isNotEmpty) _autoCopy(code);
     } catch (e) {
-      if (mounted) {
-        setState(() => _waitResult = {
-              'status': 'timeout/gagal',
-              'pesan': e is ApiException ? e.message : e.toString(),
-            });
-      }
+      if (!mounted || gen != _waitGen) return;
+      final stale = e is ApiException && e.details is Map
+          ? (e.details as Map)['stale_otp']
+          : null;
+      setState(() {
+        if (stale is Map) {
+          _waitResult = {'otp': stale['otp'], 'message': stale};
+          _waitStale = true;
+        } else {
+          _waitResult = {
+            'status': e is ApiException && e.code == 'WAIT_TIMEOUT'
+                ? 'Waktu habis, tidak ada OTP baru'
+                : 'Gagal',
+            'pesan': errorText(e),
+          };
+        }
+      });
     } finally {
-      if (mounted) setState(() => _waiting = false);
+      if (gen == _waitGen) {
+        _stopWaitTick();
+        if (mounted) setState(() => _waiting = false);
+      }
     }
   }
 
   Future<void> _waitAny() async {
     final refs = _refsCtl.text
-        .split(RegExp(r'[\n,]'))
+        .split(RegExp(r'[\n,;\s]+'))
         .map((e) => e.trim())
         .where((e) => e.isNotEmpty)
+        .toSet()
         .toList();
     if (refs.isEmpty) {
       showError(context, 'Isi dulu daftar alamatnya');
+      return;
+    }
+    if (refs.length > 10) {
+      showError(context, 'Maksimal 10 alamat (sekarang ${refs.length})');
       return;
     }
     setState(() {
@@ -103,16 +253,20 @@ class _OtpScreenState extends State<OtpScreen> {
       _waitAnyResult = null;
     });
     try {
-      final t = int.tryParse(_timeoutCtl.text) ?? 50;
       final r = await api.otpWaitAny(
-          refs: refs, timeout: t.clamp(5, 280), mode: _waitAnyMode);
+        refs: refs,
+        timeout: _timeout,
+        mode: _waitAnyMode,
+      );
       if (mounted) setState(() => _waitAnyResult = r);
     } catch (e) {
       if (mounted) {
-        setState(() => _waitAnyResult = {
-              'status': 'timeout/gagal',
-              'pesan': e is ApiException ? e.message : e.toString(),
-            });
+        setState(
+          () => _waitAnyResult = {
+            'status': 'timeout/gagal',
+            'pesan': errorText(e),
+          },
+        );
       }
     } finally {
       if (mounted) setState(() => _waitingAny = false);
@@ -122,6 +276,7 @@ class _OtpScreenState extends State<OtpScreen> {
   void _toggleStream() {
     if (_streaming) {
       _sub?.cancel();
+      _sub = null;
       setState(() => _streaming = false);
       return;
     }
@@ -131,35 +286,50 @@ class _OtpScreenState extends State<OtpScreen> {
       _streaming = true;
       _streamLog.clear();
     });
-    _sub = api.otpStream(ref).listen(
-      (ev) {
-        if (!mounted) return;
-        setState(() {
-          _streamLog.insert(0,
-              '${ev['event']}: ${ev['otp'] ?? ev['code'] ?? ev['data'] ?? ev['raw'] ?? ''}');
-          if (_streamLog.length > 50) _streamLog.removeLast();
-        });
-        if (ev['event'] == 'timeout') {
-          _sub?.cancel();
-          setState(() => _streaming = false);
-        }
-      },
-      onError: (e) {
-        if (mounted) {
-          setState(() {
-            _streamLog.insert(0, 'error: $e');
-            _streaming = false;
-          });
-        }
-      },
-      onDone: () {
-        if (mounted) setState(() => _streaming = false);
-      },
-    );
+    _sub = api
+        .otpStream(ref)
+        .listen(
+          (ev) {
+            if (!mounted) return;
+            final code = ev['otp'] ?? ev['code'];
+            setState(() {
+              final detail =
+                  code ??
+                  ev['subject'] ??
+                  ev['message'] ??
+                  ev['data'] ??
+                  ev['raw'] ??
+                  '';
+              final t = TimeOfDay.now().format(context);
+              _streamLog.insert(0, '$t  ${ev['event']}: $detail');
+              if (_streamLog.length > 50) _streamLog.removeLast();
+            });
+            if (ev['event'] == 'otp' && code != null) {
+              _autoCopy(code.toString());
+            }
+            if (ev['event'] == 'timeout') {
+              _sub?.cancel();
+              _sub = null;
+              setState(() => _streaming = false);
+            }
+          },
+          onError: (e) {
+            if (mounted) {
+              setState(() {
+                _streamLog.insert(0, 'error: ${errorText(e)}');
+                _streaming = false;
+              });
+            }
+          },
+          onDone: () {
+            if (mounted) setState(() => _streaming = false);
+          },
+        );
   }
 
   Future<void> _extract() async {
     if (_extractCtl.text.trim().isEmpty) return;
+    FocusScope.of(context).unfocus();
     try {
       final r = await api.otpExtract(_extractCtl.text);
       if (mounted) setState(() => _extractResult = r);
@@ -171,10 +341,13 @@ class _OtpScreenState extends State<OtpScreen> {
   Future<void> _verify(bool wait) async {
     final ref = _ref;
     if (ref == null) return;
+    final gen = _refGen;
     if (wait) setState(() => _verifyWaiting = true);
     try {
-      final r = wait ? await api.verifyWait(ref) : await api.verifyLatest(ref);
-      if (mounted) {
+      final r = wait
+          ? await api.verifyWait(ref, timeout: _timeout)
+          : await api.verifyLatest(ref);
+      if (mounted && gen == _refGen) {
         setState(() {
           if (wait) {
             _verifyWait = r;
@@ -184,278 +357,395 @@ class _OtpScreenState extends State<OtpScreen> {
         });
       }
     } catch (e) {
-      if (mounted) showError(context, e);
+      if (mounted && gen == _refGen) showError(context, e);
     } finally {
-      if (mounted) setState(() => _verifyWaiting = false);
+      if (mounted && wait && gen == _refGen) {
+        setState(() => _verifyWaiting = false);
+      }
     }
   }
 
-  Widget _otpCard(String title, dynamic r, {String key = 'otp'}) {
+  /// Ambil nilai utama (kode OTP / URL link) dari respons.
+  String? _value(dynamic r, String key) {
+    if (r is! Map) return null;
+    final v = r[key] ?? (key == 'link' ? r['url'] : null);
+    if (v is Map) return (v['url'] ?? v['href'] ?? v['code'])?.toString();
+    return v?.toString();
+  }
+
+  Widget _otpCard(
+    String title,
+    dynamic r, {
+    String key = 'otp',
+    bool stale = false,
+  }) {
     final s = Theme.of(context).colorScheme;
-    final code = r is Map ? r[key]?.toString() : null;
+    final code = _value(r, key);
+    final msg = r is Map && r['message'] is Map ? r['message'] as Map : null;
+    final isLink = key == 'link';
     return Card(
+      color: code != null && !stale && !isLink ? s.primaryContainer : null,
       child: Padding(
         padding: const EdgeInsets.all(14),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
-          const SizedBox(height: 8),
-          if (r == null)
-            Text('Belum dimuat.', style: TextStyle(color: s.onSurfaceVariant))
-          else if (code != null && code.isNotEmpty)
-            Row(children: [
-              Expanded(
-                child: Text(code,
-                    style: const TextStyle(
-                        fontSize: 26,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 2)),
-              ),
-              IconButton(
-                icon: const Icon(Icons.copy),
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: code));
-                  showOk(context, 'Disalin');
-                },
-              ),
-            ])
-          else
-            JsonView(r),
-          if (r is Map && r['message'] is Map)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Text(
-                  '${r['message']['subject'] ?? ''} — ${r['message']['from'] ?? ''}',
-                  style: TextStyle(color: s.onSurfaceVariant)),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    title,
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+                if (stale)
+                  Chip(
+                    label: const Text('OTP LAMA'),
+                    visualDensity: VisualDensity.compact,
+                    side: BorderSide.none,
+                    backgroundColor: s.tertiaryContainer,
+                  ),
+              ],
             ),
-        ]),
+            const SizedBox(height: 8),
+            if (r == null)
+              Text('Belum dimuat.', style: TextStyle(color: s.onSurfaceVariant))
+            else if (code != null && code.isNotEmpty)
+              Row(
+                children: [
+                  Expanded(
+                    child: SelectableText(
+                      code,
+                      maxLines: isLink ? 3 : 1,
+                      style: isLink
+                          ? const TextStyle(fontSize: 13)
+                          : const TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: 3,
+                            ),
+                    ),
+                  ),
+                  IconButton.filledTonal(
+                    tooltip: 'Salin',
+                    icon: const Icon(Icons.copy),
+                    onPressed: () => copyText(context, code),
+                  ),
+                ],
+              )
+            else
+              JsonView(r),
+            if (msg != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(
+                  [msg['subject'], msg['from'], agoText(msg['age_seconds'])]
+                      .where((e) => e != null && e.toString().isNotEmpty)
+                      .join(' • '),
+                  style: TextStyle(color: s.onSurfaceVariant),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
 
+  Widget _section(String title, List<Widget> children, {Widget? trailing}) =>
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      title,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  ?trailing,
+                ],
+              ),
+              const SizedBox(height: 8),
+              ...children,
+            ],
+          ),
+        ),
+      );
+
   @override
   Widget build(BuildContext context) {
     final ref = _ref;
+    final s = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(title: const Text('OTP & Verifikasi')),
       body: ref == null
           ? const EmptyState(
               icon: Icons.pin_outlined,
               title: 'Belum ada mailbox aktif',
-              subtitle: 'Buat alamat dulu di tab Beranda.')
+              subtitle: 'Buat alamat dulu di tab Beranda.',
+            )
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
-                Text('Mailbox: ${appState.activeAddress}',
-                    style: const TextStyle(fontWeight: FontWeight.w600)),
+                InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => copyText(
+                    context,
+                    appState.activeAddress ?? ref,
+                    'Alamat disalin',
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Icon(Icons.alternate_email, size: 18, color: s.primary),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            appState.activeAddress ?? ref,
+                            style: const TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        Icon(Icons.copy, size: 16, color: s.onSurfaceVariant),
+                      ],
+                    ),
+                  ),
+                ),
                 const SizedBox(height: 12),
-                Row(children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      onPressed: _loadLatest,
-                      icon: const Icon(Icons.refresh),
-                      label: const Text('OTP terbaru'),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _loadingLatest ? null : _loadLatest,
+                        icon: _loadingLatest
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Icon(Icons.refresh),
+                        label: const Text('OTP terbaru'),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  SizedBox(
-                    width: 92,
-                    child: TextField(
-                      controller: _timeoutCtl,
-                      keyboardType: TextInputType.number,
-                      decoration: const InputDecoration(
-                          labelText: 'Timeout (dtk)', isDense: true),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: FilledButton.tonalIcon(
+                        onPressed: _wait,
+                        icon: Icon(
+                          _waiting ? Icons.close : Icons.hourglass_top,
+                        ),
+                        label: Text(
+                          _waiting ? 'Batal ($_waitSecs dtk)' : 'Tunggu OTP',
+                        ),
+                      ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton.tonalIcon(
-                      onPressed: _waiting ? null : _wait,
-                      icon: _waiting
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2))
-                          : const Icon(Icons.hourglass_top),
-                      label: const Text('Tunggu OTP'),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        'Batas waktu tunggu',
+                        style: TextStyle(color: s.onSurfaceVariant),
+                      ),
                     ),
+                    SizedBox(
+                      width: 96,
+                      child: TextField(
+                        controller: _timeoutCtl,
+                        enabled: !_waiting,
+                        keyboardType: TextInputType.number,
+                        textAlign: TextAlign.center,
+                        inputFormatters: [
+                          FilteringTextInputFormatter.digitsOnly,
+                        ],
+                        decoration: const InputDecoration(
+                          suffixText: 'dtk',
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                if (_waiting) ...[
+                  const SizedBox(height: 8),
+                  LinearProgressIndicator(
+                    value: (_waitSecs / _timeout).clamp(0.0, 1.0),
                   ),
-                ]),
+                ],
                 const SizedBox(height: 12),
-                _otpCard('OTP terbaru', _latest),
+                if (_latestEmpty != null)
+                  Card(
+                    child: ListTile(
+                      leading: const Icon(Icons.mark_email_unread_outlined),
+                      title: Text(_latestEmpty!),
+                    ),
+                  )
+                else
+                  _otpCard('OTP terbaru', _latest),
                 if (_waitResult != null) ...[
                   const SizedBox(height: 10),
-                  _otpCard('Hasil tunggu OTP', _waitResult),
+                  _otpCard('Hasil tunggu OTP', _waitResult, stale: _waitStale),
                 ],
                 const SizedBox(height: 16),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Stream real-time (SSE)',
-                              style: TextStyle(fontWeight: FontWeight.w700)),
-                          const SizedBox(height: 8),
-                          FilledButton.icon(
-                            onPressed: _toggleStream,
-                            icon: Icon(_streaming ? Icons.stop : Icons.play_arrow),
-                            label: Text(_streaming ? 'Berhenti' : 'Mulai stream'),
+                _section('Stream real-time (SSE)', [
+                  Text(
+                    'Pantau email masuk secara langsung; OTP otomatis disalin.',
+                    style: TextStyle(color: s.onSurfaceVariant),
+                  ),
+                  const SizedBox(height: 8),
+                  FilledButton.icon(
+                    onPressed: _toggleStream,
+                    icon: Icon(_streaming ? Icons.stop : Icons.play_arrow),
+                    label: Text(_streaming ? 'Berhenti' : 'Mulai stream'),
+                  ),
+                  if (_streaming) ...[
+                    const SizedBox(height: 8),
+                    const LinearProgressIndicator(minHeight: 2),
+                  ],
+                  if (_streamLog.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    for (final l in _streamLog.take(12))
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 4),
+                        child: Text(
+                          l,
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12,
                           ),
-                          if (_streamLog.isNotEmpty) ...[
-                            const SizedBox(height: 10),
-                            for (final l in _streamLog.take(12))
-                              Padding(
-                                padding: const EdgeInsets.only(bottom: 4),
-                                child: Text(l,
-                                    style: const TextStyle(
-                                        fontFamily: 'monospace', fontSize: 12)),
-                              ),
-                          ],
-                        ]),
-                  ),
-                ),
+                        ),
+                      ),
+                  ],
+                ]),
                 const SizedBox(height: 16),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Tunggu di banyak alamat',
-                              style: TextStyle(fontWeight: FontWeight.w700)),
-                          const SizedBox(height: 8),
-                          TextField(
-                            controller: _refsCtl,
-                            maxLines: 3,
-                            decoration: const InputDecoration(
-                                labelText: 'Daftar ref (pisah baris/koma, maks 10)'),
+                _section('Tunggu di banyak alamat', [
+                  TextField(
+                    controller: _refsCtl,
+                    maxLines: 3,
+                    minLines: 2,
+                    autocorrect: false,
+                    decoration: InputDecoration(
+                      labelText: 'Daftar ref (pisah baris/koma, maks 10)',
+                      suffixIcon: IconButton(
+                        tooltip: 'Tambah alamat aktif',
+                        icon: const Icon(Icons.add_circle_outline),
+                        onPressed: () {
+                          final t = _refsCtl.text.trim();
+                          _refsCtl.text = t.isEmpty ? ref : '$t\n$ref';
+                        },
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      SegmentedButton<String>(
+                        segments: const [
+                          ButtonSegment(value: 'otp', label: Text('OTP')),
+                          ButtonSegment(value: 'link', label: Text('Link')),
+                        ],
+                        selected: {_waitAnyMode},
+                        onSelectionChanged: (v) =>
+                            setState(() => _waitAnyMode = v.first),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: FilledButton.tonal(
+                          onPressed: _waitingAny ? null : _waitAny,
+                          child: Text(_waitingAny ? 'Menunggu…' : 'Tunggu'),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_waitAnyResult != null) ...[
+                    const SizedBox(height: 10),
+                    if (_value(_waitAnyResult, _waitAnyMode) != null)
+                      _otpCard(
+                        'Yang pertama datang',
+                        _waitAnyResult,
+                        key: _waitAnyMode,
+                      )
+                    else
+                      JsonView(_waitAnyResult),
+                  ],
+                ]),
+                const SizedBox(height: 16),
+                _section('Link verifikasi / reset', [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: () => _verify(false),
+                          child: const Text('Link terbaru'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: OutlinedButton(
+                          onPressed: _verifyWaiting
+                              ? null
+                              : () => _verify(true),
+                          child: Text(
+                            _verifyWaiting ? 'Menunggu…' : 'Tunggu link',
                           ),
-                          const SizedBox(height: 8),
-                          Row(children: [
-                            SegmentedButton<String>(
-                              segments: const [
-                                ButtonSegment(value: 'otp', label: Text('OTP')),
-                                ButtonSegment(
-                                    value: 'link', label: Text('Link')),
-                              ],
-                              selected: {_waitAnyMode},
-                              onSelectionChanged: (v) =>
-                                  setState(() => _waitAnyMode = v.first),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: FilledButton.tonal(
-                                onPressed: _waitingAny ? null : _waitAny,
-                                child: Text(_waitingAny
-                                    ? 'Menunggu…'
-                                    : 'Tunggu yang pertama datang'),
-                              ),
-                            ),
-                          ]),
-                          if (_waitAnyResult != null) ...[
-                            const SizedBox(height: 10),
-                            JsonView(_waitAnyResult),
-                          ],
-                        ]),
+                        ),
+                      ),
+                    ],
+                  ),
+                  if (_verifyLatest != null) ...[
+                    const SizedBox(height: 10),
+                    _otpCard('Link terbaru', _verifyLatest, key: 'link'),
+                  ],
+                  if (_verifyWait != null) ...[
+                    const SizedBox(height: 10),
+                    _otpCard('Hasil tunggu link', _verifyWait, key: 'link'),
+                  ],
+                ]),
+                const SizedBox(height: 16),
+                _section(
+                  'Riwayat OTP',
+                  [if (_history != null) JsonView(_history)],
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      TextButton(
+                        onPressed: _loadHistory,
+                        child: const Text('Muat'),
+                      ),
+                      TextButton(
+                        onPressed: _clearHistory,
+                        child: const Text('Bersihkan'),
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 16),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Link verifikasi / reset',
-                              style: TextStyle(fontWeight: FontWeight.w700)),
-                          const SizedBox(height: 8),
-                          Row(children: [
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed: () => _verify(false),
-                                child: const Text('Link terbaru'),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: OutlinedButton(
-                                onPressed:
-                                    _verifyWaiting ? null : () => _verify(true),
-                                child: Text(_verifyWaiting
-                                    ? 'Menunggu…'
-                                    : 'Tunggu link'),
-                              ),
-                            ),
-                          ]),
-                          if (_verifyLatest != null) ...[
-                            const SizedBox(height: 10),
-                            _otpCard('Link terbaru', _verifyLatest, key: 'link'),
-                          ],
-                          if (_verifyWait != null) ...[
-                            const SizedBox(height: 10),
-                            _otpCard('Hasil tunggu link', _verifyWait, key: 'link'),
-                          ],
-                        ]),
+                _section('Uji ekstrak OTP dari teks', [
+                  TextField(
+                    controller: _extractCtl,
+                    maxLines: 3,
+                    decoration: const InputDecoration(
+                      labelText: 'Tempel isi email di sini',
+                    ),
                   ),
-                ),
-                const SizedBox(height: 16),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(children: [
-                            const Expanded(
-                              child: Text('Riwayat OTP',
-                                  style: TextStyle(fontWeight: FontWeight.w700)),
-                            ),
-                            TextButton(
-                                onPressed: _loadHistory,
-                                child: const Text('Muat')),
-                            TextButton(
-                              onPressed: () async {
-                                final ok = await confirmDialog(context,
-                                    title: 'Bersihkan riwayat OTP?',
-                                    body: 'Riwayat OTP alamat ini dihapus.');
-                                if (!ok) return;
-                                await api.clearOtpHistory(ref);
-                                setState(() => _history = null);
-                              },
-                              child: const Text('Bersihkan'),
-                            ),
-                          ]),
-                          if (_history != null) JsonView(_history),
-                        ]),
+                  const SizedBox(height: 8),
+                  FilledButton.tonal(
+                    onPressed: _extract,
+                    child: const Text('Ekstrak'),
                   ),
-                ),
-                const SizedBox(height: 16),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text('Uji ekstrak OTP dari teks',
-                              style: TextStyle(fontWeight: FontWeight.w700)),
-                          const SizedBox(height: 8),
-                          TextField(
-                            controller: _extractCtl,
-                            maxLines: 3,
-                            decoration: const InputDecoration(
-                                labelText: 'Tempel isi email di sini'),
-                          ),
-                          const SizedBox(height: 8),
-                          FilledButton.tonal(
-                              onPressed: _extract,
-                              child: const Text('Ekstrak')),
-                          if (_extractResult != null) ...[
-                            const SizedBox(height: 10),
-                            JsonView(_extractResult),
-                          ],
-                        ]),
-                  ),
-                ),
+                  if (_extractResult != null) ...[
+                    const SizedBox(height: 10),
+                    JsonView(_extractResult),
+                  ],
+                ]),
               ],
             ),
     );
