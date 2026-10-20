@@ -30,8 +30,12 @@ Di GitHub Actions, token dibaca dari **Secrets** repo (`API_TOKEN`).
 
 ```bash
 flutter pub get
+flutter analyze && flutter test
 flutter build apk --release --split-per-abi \
   --dart-define=API_TOKEN=<token>
 ```
+
+Tanpa `android/key.properties`, APK release ditandatangani dengan kunci
+debug (cukup untuk dicoba sendiri). CI selalu memakai keystore dari Secrets.
 
 Paket: `com.rosdie.tempmail` • Min SDK 24 • Flutter 3.47.7
