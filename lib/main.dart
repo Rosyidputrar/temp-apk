@@ -5,6 +5,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'api.dart';
@@ -247,6 +248,11 @@ class TempMailApp extends StatelessWidget {
     return MaterialApp(
       title: 'TempMail',
       navigatorKey: navigatorKey,
+      // Teks bawaan Material (tooltip Kembali, menu Salin/Tempel, dll.)
+      // dalam bahasa Indonesia.
+      locale: const Locale('id'),
+      supportedLocales: const [Locale('id'), Locale('en')],
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
       debugShowCheckedModeBanner: false,
       theme: theme(scheme),
       darkTheme: theme(darkScheme),
