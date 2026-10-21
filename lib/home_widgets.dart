@@ -14,6 +14,7 @@ import 'package:home_widget/home_widget.dart';
 
 import 'api.dart';
 import 'main.dart';
+import 'otp_detect.dart';
 
 const kOtpWidget = 'OtpWidgetProvider';
 const kQuickWidget = 'QuickWidgetProvider';
@@ -195,6 +196,7 @@ Future<void> _bgRefresh() async {
   final results = await Future.wait([
     _latestItem(() => api.otpLatest(ref), link: false),
     _latestItem(() => api.verifyLatest(ref), link: true),
+    _inboxOtpItem(ref),
   ]);
   final found = results.whereType<_Item>().toList()
     ..sort((a, b) => b.at.compareTo(a.at));
@@ -215,6 +217,30 @@ Future<void> _bgRefresh() async {
   }
   await _save({'updated': _hhmm(DateTime.now())});
   await _refreshWidgets();
+}
+
+/// Cadangan: OTP yang tidak dikenali server, dideteksi dari email terbaru.
+Future<Object?> _inboxOtpItem(String ref) async {
+  try {
+    final r = await api.messages(ref, limit: 10, fresh: true);
+    for (final m in listOf(r, ['messages', 'items']).whereType<Map>()) {
+      final hit = messageOtp(m);
+      if (hit == null || hit.$2) continue; // yang dikenali server sudah ada
+      final age = m['age_seconds'];
+      return _Item(
+        hit.$1,
+        false,
+        m['subject']?.toString(),
+        m['from']?.toString(),
+        age is num
+            ? DateTime.now().subtract(Duration(seconds: age.round()))
+            : DateTime.now(),
+      );
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
 }
 
 class _Item {
