@@ -187,6 +187,37 @@ class _OtpScreenState extends State<OtpScreen> {
     if (mounted) showOk(context, 'OTP $code disalin otomatis');
   }
 
+  /// Link verifikasi/login masuk: salin otomatis, kirim ke widget, dan
+  /// (bila [notify] & tab OTP tidak sedang dilihat) tampilkan notifikasi.
+  Future<void> _gotLink(
+    String url,
+    dynamic msg, {
+    String? address,
+    bool notify = true,
+  }) async {
+    final m = msg is Map ? msg : const {};
+    await Clipboard.setData(ClipboardData(text: url));
+    HapticFeedback.mediumImpact();
+    if (mounted) showOk(context, 'Link disalin otomatis');
+    if (address == null || address == _addr) {
+      HomeWidgets.publishLink(
+        url,
+        subject: m['subject']?.toString(),
+        from: m['from']?.toString(),
+      );
+    }
+    if (!notify ||
+        (Notifier.instance.inForeground && currentTab.value == kTabOtp)) {
+      return;
+    }
+    Notifier.instance.linkArrived(
+      url,
+      subject: m['subject']?.toString(),
+      from: m['from']?.toString(),
+      address: address ?? _addr,
+    );
+  }
+
   Future<void> _loadLatest() async {
     final ref = _ref;
     if (ref == null) return;
@@ -367,14 +398,14 @@ class _OtpScreenState extends State<OtpScreen> {
       );
       if (gen != _anyGen) return;
       if (mounted) setState(() => _waitAnyResult = r);
+      final addr = r is Map ? (r['address'] ?? r['ref'])?.toString() : null;
       final code = r is Map ? r['otp']?.toString() : null;
-      if (code != null && code.isNotEmpty) {
+      final link = _waitAnyMode == 'link' ? _value(r, 'link') : null;
+      if (link != null && link.isNotEmpty) {
+        _gotLink(link, r is Map ? r['message'] : null, address: addr);
+      } else if (code != null && code.isNotEmpty) {
         _autoCopy(code);
-        _notifyOtp(
-          code,
-          r['message'],
-          address: (r['address'] ?? r['ref'])?.toString(),
-        );
+        _notifyOtp(code, r['message'], address: addr);
       }
     } catch (e) {
       if (gen != _anyGen) return;
@@ -496,6 +527,12 @@ class _OtpScreenState extends State<OtpScreen> {
             _verifyLatest = r;
           }
         });
+        final link = _value(r, 'link');
+        if (link != null && link.isNotEmpty) {
+          // "Tunggu link" → notifikasi bila ditinggal; "Link terbaru" dipicu
+          // dari aplikasi → cukup disalin.
+          _gotLink(link, r is Map ? r['message'] : null, notify: wait);
+        }
       }
     } catch (e) {
       if (wait && vgen != _verifyGen) return;
@@ -645,6 +682,17 @@ class _OtpScreenState extends State<OtpScreen> {
                             ),
                     ),
                   ),
+                  if (isLink)
+                    IconButton(
+                      tooltip: 'Buka di browser',
+                      icon: const Icon(Icons.open_in_new),
+                      onPressed: () async {
+                        final ok = await openExternalUrl(code);
+                        if (!ok && mounted) {
+                          showError(context, 'Link tidak bisa dibuka: $code');
+                        }
+                      },
+                    ),
                   IconButton.filledTonal(
                     tooltip: 'Salin',
                     icon: const Icon(Icons.copy),

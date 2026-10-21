@@ -95,7 +95,7 @@ class HomeWidgets {
       await _save({
         'address': address,
         'ref': ref,
-        if (clearOtp) 'otp': null,
+        if (clearOtp) ..._noItem,
         if (clearOtp)
           'otp_info': address == null ? null : 'Belum dimuat — ketuk ⟳',
         'updated': _hhmm(DateTime.now()),
@@ -113,8 +113,25 @@ class HomeWidgets {
     if (!_supported) return;
     try {
       await _save({
-        'otp': code,
+        ..._otpItem(code),
         'otp_info': _otpInfo(subject, from, DateTime.now()),
+        'updated': _hhmm(DateTime.now()),
+      });
+      await _refreshWidgets();
+    } catch (_) {}
+  }
+
+  /// Link verifikasi/login baru diketahui aplikasi → ganti isi kotak widget.
+  static Future<void> publishLink(
+    String url, {
+    String? subject,
+    String? from,
+  }) async {
+    if (!_supported) return;
+    try {
+      await _save({
+        ..._linkItem(url),
+        'otp_info': _otpInfo(subject, from, DateTime.now(), link: true),
         'updated': _hhmm(DateTime.now()),
       });
       await _refreshWidgets();
@@ -122,7 +139,33 @@ class HomeWidgets {
   }
 }
 
-String _otpInfo(String? subject, String? from, DateTime at) => [
+// Kotak di widget menampilkan item terakhir: OTP atau link. Widget membaca
+// item_kind/item_value (tombol salin kedua ikut berganti "OTP"/"Link").
+const Map<String, String?> _noItem = {
+  'item_kind': null,
+  'item_value': null,
+  'otp': null,
+};
+
+Map<String, String?> _otpItem(String code) => {
+  'item_kind': 'otp',
+  'item_value': code,
+  'otp': code,
+};
+
+Map<String, String?> _linkItem(String url) => {
+  'item_kind': 'link',
+  'item_value': url,
+  'otp': null,
+};
+
+String _otpInfo(
+  String? subject,
+  String? from,
+  DateTime at, {
+  bool link = false,
+}) => [
+  if (link) 'Link verifikasi',
   subject,
   from,
   'pukul ${_hhmm(at)}',
@@ -146,34 +189,73 @@ Future<void> _bgRefresh() async {
     await _save({'otp_info': 'Belum ada alamat aktif — buka TempMail'});
     return _refreshWidgets();
   }
-  await _save({'otp_info': 'Memuat OTP terbaru…'});
+  await _save({'otp_info': 'Memuat OTP & link terbaru…'});
   await _refreshWidgets();
-  try {
-    final r = await api.otpLatest(ref);
-    final msg = r is Map && r['message'] is Map ? r['message'] as Map : null;
-    final code = r is Map ? r['otp']?.toString() : null;
-    final age = msg?['age_seconds'];
-    final at = age is num
-        ? DateTime.now().subtract(Duration(seconds: age.round()))
-        : DateTime.now();
+  // OTP dan link diambil bersamaan; yang paling baru masuk ditampilkan.
+  final results = await Future.wait([
+    _latestItem(() => api.otpLatest(ref), link: false),
+    _latestItem(() => api.verifyLatest(ref), link: true),
+  ]);
+  final found = results.whereType<_Item>().toList()
+    ..sort((a, b) => b.at.compareTo(a.at));
+  final errors = results.whereType<String>().toList();
+  if (found.isNotEmpty) {
+    final it = found.first;
     await _save({
-      'otp': code,
-      'otp_info': code == null
-          ? 'Belum ada email berisi OTP'
-          : _otpInfo(msg?['subject']?.toString(), msg?['from']?.toString(), at),
+      ...(it.link ? _linkItem(it.value) : _otpItem(it.value)),
+      'otp_info': _otpInfo(it.subject, it.from, it.at, link: it.link),
     });
-  } on ApiException catch (e) {
+  } else {
     await _save({
-      if (e.code == 'NO_OTP' || e.status == 404) 'otp': null,
-      'otp_info': e.code == 'NO_OTP' || e.status == 404
-          ? 'Belum ada email berisi OTP'
-          : 'Gagal: ${e.message}',
+      ..._noItem,
+      'otp_info': errors.isEmpty
+          ? 'Belum ada email berisi OTP / link'
+          : 'Gagal: ${errors.first}',
     });
-  } catch (e) {
-    await _save({'otp_info': 'Gagal memuat: $e'});
   }
   await _save({'updated': _hhmm(DateTime.now())});
   await _refreshWidgets();
+}
+
+class _Item {
+  final String value;
+  final bool link;
+  final String? subject;
+  final String? from;
+  final DateTime at;
+  _Item(this.value, this.link, this.subject, this.from, this.at);
+}
+
+/// _Item bila ada, null bila memang kosong, String bila galat.
+Future<Object?> _latestItem(
+  Future<dynamic> Function() fetch, {
+  required bool link,
+}) async {
+  try {
+    final r = await fetch();
+    if (r is! Map) return null;
+    final raw = link ? (r['link'] ?? r['url']) : r['otp'];
+    final value = raw is Map ? (raw['url'] ?? raw['href']) : raw;
+    if (value == null || '$value'.isEmpty) return null;
+    final msg = r['message'] is Map ? r['message'] as Map : null;
+    final age = msg?['age_seconds'] ?? r['age_seconds'];
+    final at = age is num
+        ? DateTime.now().subtract(Duration(seconds: age.round()))
+        : DateTime.now();
+    return _Item(
+      '$value',
+      link,
+      msg?['subject']?.toString(),
+      msg?['from']?.toString(),
+      at,
+    );
+  } on ApiException catch (e) {
+    // Belum ada OTP/link = bukan galat.
+    if (e.status == 404 || e.code.startsWith('NO_')) return null;
+    return e.message;
+  } catch (e) {
+    return '$e';
+  }
 }
 
 Future<void> _bgQuick(String group) async {
@@ -192,7 +274,7 @@ Future<void> _bgQuick(String group) async {
     await _save({
       'address': address,
       'ref': ref,
-      'otp': null,
+      ..._noItem,
       'otp_info': 'Alamat baru — ketuk ⟳ setelah kirim email',
       'quick_status': 'Disalin: $address',
       // Disalin oleh QuickWidgetProvider (clipboard butuh konteks native).
