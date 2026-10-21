@@ -103,6 +103,35 @@ void _onNotificationAction(String action, String payload) {
 /// memuat ulang (Favorit) atau menghentikan auto-refresh (Inbox).
 final currentTab = ValueNotifier<int>(0);
 
+/// Alamat favorit (huruf kecil), dibagi Beranda & tab Favorit supaya tombol
+/// Favorit di Beranda selalu sesuai dengan daftar favorit.
+final favoriteAddresses = ValueNotifier<Set<String>>(<String>{});
+
+String _normAddr(String a) => a.trim().toLowerCase();
+
+bool isFavorite(String? address) =>
+    address != null && favoriteAddresses.value.contains(_normAddr(address));
+
+void setFavoritesFrom(List<dynamic> items) {
+  favoriteAddresses.value = {
+    for (final f in items)
+      if (f is Map && '${f['address'] ?? ''}'.trim().isNotEmpty)
+        _normAddr('${f['address']}'),
+  };
+}
+
+void markFavorite(String address, bool on) {
+  final s = {...favoriteAddresses.value};
+  on ? s.add(_normAddr(address)) : s.remove(_normAddr(address));
+  favoriteAddresses.value = s;
+}
+
+Future<void> refreshFavorites() async {
+  try {
+    setFavoritesFrom(listOf(await api.favorites(), ['items', 'favorites']));
+  } catch (_) {}
+}
+
 const int kTabHome = 0;
 const int kTabInbox = 1;
 const int kTabOtp = 2;

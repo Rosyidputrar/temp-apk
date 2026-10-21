@@ -140,14 +140,21 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     appState.addListener(_onState);
     currentTab.addListener(_onTab);
+    favoriteAddresses.addListener(_onFavorites);
     _loadInfo();
     _loadGroupCounts();
+    refreshFavorites();
+  }
+
+  void _onFavorites() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     appState.removeListener(_onState);
     currentTab.removeListener(_onTab);
+    favoriteAddresses.removeListener(_onFavorites);
     _alias.dispose();
     _domain.dispose();
     _group.dispose();
@@ -166,7 +173,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Kembali ke Beranda dari tab lain → jumlah pesan ikut diperbarui.
   void _onTab() {
-    if (currentTab.value == kTabHome) _loadInfo();
+    if (currentTab.value == kTabHome) {
+      _loadInfo();
+      refreshFavorites(); // favorit bisa berubah di tab lain
+    }
   }
 
   /// [showErrors] = tampilkan galat (saat refresh manual); muat otomatis diam.
@@ -191,7 +201,11 @@ class _HomeScreenState extends State<HomeScreen> {
     if (_refreshing) return;
     setState(() => _refreshing = true);
     try {
-      await Future.wait([_loadInfo(showErrors: true), _loadGroupCounts()]);
+      await Future.wait([
+        _loadInfo(showErrors: true),
+        _loadGroupCounts(),
+        refreshFavorites(),
+      ]);
     } finally {
       if (mounted) setState(() => _refreshing = false);
     }
@@ -267,14 +281,29 @@ class _HomeScreenState extends State<HomeScreen> {
         await api.clearCache(ref);
         if (mounted) showOk(context, 'Cache mailbox dibersihkan');
       } else if (kind == 'fav') {
-        final r = await api.addFavorite(appState.activeAddress ?? ref);
-        if (mounted) {
-          showOk(
+        // Toggle seperti web resmi: sudah favorit → hapus (dengan konfirmasi).
+        final addr = appState.activeAddress ?? ref;
+        if (isFavorite(addr)) {
+          final ok = await confirmDialog(
             context,
-            r is Map && r['created'] == false
-                ? 'Sudah ada di favorit'
-                : 'Ditambahkan ke favorit',
+            title: 'Hapus dari favorit?',
+            body: '$addr tidak akan tersimpan permanen lagi.',
           );
+          if (!ok) return;
+          await api.removeFavorite(addr);
+          markFavorite(addr, false);
+          if (mounted) showOk(context, 'Dihapus dari favorit');
+        } else {
+          final r = await api.addFavorite(addr);
+          markFavorite(addr, true);
+          if (mounted) {
+            showOk(
+              context,
+              r is Map && r['created'] == false
+                  ? 'Sudah ada di favorit'
+                  : 'Ditambahkan ke favorit',
+            );
+          }
         }
       } else if (kind == 'wipe') {
         final ok = await confirmDialog(
@@ -443,11 +472,18 @@ class _HomeScreenState extends State<HomeScreen> {
                         spacing: 8,
                         runSpacing: 8,
                         children: [
-                          OutlinedButton.icon(
-                            onPressed: () => _action('fav'),
-                            icon: const Icon(Icons.star_outline, size: 18),
-                            label: const Text('Favorit'),
-                          ),
+                          if (isFavorite(addr))
+                            FilledButton.tonalIcon(
+                              onPressed: () => _action('fav'),
+                              icon: const Icon(Icons.star, size: 18),
+                              label: const Text('Favorit'),
+                            )
+                          else
+                            OutlinedButton.icon(
+                              onPressed: () => _action('fav'),
+                              icon: const Icon(Icons.star_outline, size: 18),
+                              label: const Text('Favoritkan'),
+                            ),
                           OutlinedButton.icon(
                             onPressed: () => _action('read'),
                             icon: const Icon(Icons.done_all, size: 18),

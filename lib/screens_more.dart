@@ -65,6 +65,7 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
     try {
       final r = await api.favorites();
       final list = listOf(r, ['items', 'favorites']).toList();
+      setFavoritesFrom(list);
       // Yang disematkan selalu di atas.
       list.sort((a, b) {
         final pa = a is Map && a['pinned'] == true ? 0 : 1;
