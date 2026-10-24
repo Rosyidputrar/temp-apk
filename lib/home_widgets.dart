@@ -181,9 +181,13 @@ Future<void> homeWidgetCallback(Uri? uri) async {
   WidgetsFlutterBinding.ensureInitialized();
   // Isolate latar tidak berbagi memori dengan aplikasi: baca sesi akun dulu.
   if (kPublic) {
-    await authState.load();
+    await authState.load(background: true);
     if (!authState.signedIn) {
+      // Jangan tampilkan data akun sebelumnya.
       await _save({
+        'address': null,
+        'ref': null,
+        ..._noItem,
         'otp_info': 'Belum login — buka TempMail',
         'quick_status': 'Belum login — buka TempMail',
       });

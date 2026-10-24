@@ -142,6 +142,10 @@ class UpdateService extends ChangeNotifier {
        _buildOverride = currentBuild;
   static final instance = UpdateService._();
 
+  /// Tanpa repo rilis (APK admin dari repo publik: APK berisi token tidak boleh
+  /// dirilis terbuka) → pembaruan lewat aplikasi dimatikan.
+  bool get enabled => repo.trim().isNotEmpty;
+
   /// Instans terpisah untuk tes (server tiruan, folder sementara).
   @visibleForTesting
   factory UpdateService.forTest({
@@ -249,7 +253,7 @@ class UpdateService extends ChangeNotifier {
     }
     await _restore();
     // Periksa diam-diam saat aplikasi dibuka.
-    unawaited(check(silent: true));
+    if (enabled) unawaited(check(silent: true));
   }
 
   void _onNotifAction(String action, String payload) {
@@ -337,7 +341,7 @@ class UpdateService extends ChangeNotifier {
   // ---------------- cek versi ----------------
 
   Future<void> check({bool silent = false}) async {
-    if (status == UpdateStatus.checking || busy) return;
+    if (!enabled || status == UpdateStatus.checking || busy) return;
     final before = status;
     checkError = null;
     _set(UpdateStatus.checking);
@@ -1210,83 +1214,96 @@ class _UpdateScreenState extends State<UpdateScreen> {
               ),
             ],
           ),
-          body: ListView(
-            padding: const EdgeInsets.all(16),
-            children: [
-              Card(
-                child: Column(
+          body: !u.enabled
+              ? const EmptyState(
+                  icon: Icons.system_update_outlined,
+                  title: 'Pembaruan lewat aplikasi tidak aktif',
+                  subtitle:
+                      'APK admin berisi token admin, jadi tidak dirilis di repo publik. '
+                      'Ambil APK admin terbaru dari artifact build GitHub Actions '
+                      '(7z berpassword), lalu pasang manual.',
+                )
+              : ListView(
+                  padding: const EdgeInsets.all(16),
                   children: [
-                    ListTile(
-                      leading: const Icon(Icons.phone_android),
-                      title: Text(
-                        cur == null
-                            ? 'Terpasang: build lokal'
-                            : 'Terpasang: b$cur',
-                      ),
-                      subtitle: Text(
-                        [
-                          if (u.versionName.isNotEmpty) 'v${u.versionName}',
-                          if (u.abis.isNotEmpty) u.abis.first,
-                          if (cur == null) 'tidak bisa dibandingkan',
-                        ].join(' · '),
+                    Card(
+                      child: Column(
+                        children: [
+                          ListTile(
+                            leading: const Icon(Icons.phone_android),
+                            title: Text(
+                              cur == null
+                                  ? 'Terpasang: build lokal'
+                                  : 'Terpasang: b$cur',
+                            ),
+                            subtitle: Text(
+                              [
+                                if (u.versionName.isNotEmpty)
+                                  'v${u.versionName}',
+                                if (u.abis.isNotEmpty) u.abis.first,
+                                if (cur == null) 'tidak bisa dibandingkan',
+                              ].join(' · '),
+                            ),
+                          ),
+                          ListTile(
+                            leading: const Icon(Icons.cloud_outlined),
+                            title: Text(
+                              r == null
+                                  ? 'Terbaru: belum diketahui'
+                                  : 'Terbaru: ${r.tag}',
+                            ),
+                            subtitle: Text(
+                              [
+                                if (r?.published != null)
+                                  'rilis ${fmtTime(r!.published!.toIso8601String())}',
+                                if (r?.size != null) fmtBytes(r!.size),
+                                if (r != null) r.assetName,
+                                if (u.lastCheck != null)
+                                  'diperiksa ${TimeOfDay.fromDateTime(u.lastCheck!).format(ctx)}',
+                              ].join(' · '),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                    ListTile(
-                      leading: const Icon(Icons.cloud_outlined),
-                      title: Text(
-                        r == null
-                            ? 'Terbaru: belum diketahui'
-                            : 'Terbaru: ${r.tag}',
+                    const SizedBox(height: 12),
+                    _statusCard(s),
+                    if (u.checkError != null) ...[
+                      const SizedBox(height: 12),
+                      Card(
+                        color: s.errorContainer,
+                        child: ListTile(
+                          leading: Icon(
+                            Icons.cloud_off,
+                            color: s.onErrorContainer,
+                          ),
+                          title: Text(
+                            'Gagal memeriksa versi terbaru',
+                            style: TextStyle(color: s.onErrorContainer),
+                          ),
+                          subtitle: Text(
+                            u.checkError!,
+                            style: TextStyle(color: s.onErrorContainer),
+                          ),
+                        ),
                       ),
-                      subtitle: Text(
-                        [
-                          if (r?.published != null)
-                            'rilis ${fmtTime(r!.published!.toIso8601String())}',
-                          if (r?.size != null) fmtBytes(r!.size),
-                          if (r != null) r.assetName,
-                          if (u.lastCheck != null)
-                            'diperiksa ${TimeOfDay.fromDateTime(u.lastCheck!).format(ctx)}',
-                        ].join(' · '),
+                    ],
+                    if (r != null && r.notes.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Catatan rilis',
+                        style: TextStyle(fontWeight: FontWeight.w700),
                       ),
+                      const SizedBox(height: 6),
+                      SelectableText(r.notes),
+                    ],
+                    const SizedBox(height: 16),
+                    Text(
+                      'Sumber: github.com/$kUpdateRepo/releases',
+                      style: TextStyle(color: s.onSurfaceVariant, fontSize: 12),
                     ),
                   ],
                 ),
-              ),
-              const SizedBox(height: 12),
-              _statusCard(s),
-              if (u.checkError != null) ...[
-                const SizedBox(height: 12),
-                Card(
-                  color: s.errorContainer,
-                  child: ListTile(
-                    leading: Icon(Icons.cloud_off, color: s.onErrorContainer),
-                    title: Text(
-                      'Gagal memeriksa versi terbaru',
-                      style: TextStyle(color: s.onErrorContainer),
-                    ),
-                    subtitle: Text(
-                      u.checkError!,
-                      style: TextStyle(color: s.onErrorContainer),
-                    ),
-                  ),
-                ),
-              ],
-              if (r != null && r.notes.isNotEmpty) ...[
-                const SizedBox(height: 12),
-                const Text(
-                  'Catatan rilis',
-                  style: TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 6),
-                SelectableText(r.notes),
-              ],
-              const SizedBox(height: 16),
-              Text(
-                'Sumber: github.com/$kUpdateRepo/releases',
-                style: TextStyle(color: s.onSurfaceVariant, fontSize: 12),
-              ),
-            ],
-          ),
         );
       },
     );

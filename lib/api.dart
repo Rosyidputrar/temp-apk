@@ -135,17 +135,30 @@ class TempmailApi {
   });
 
   /// Bongkar amplop standar {ok, data, meta} / {ok:false, error}.
-  ApiResult _unwrap(int status, dynamic parsed, [String? fallbackMsg]) {
+  ApiResult _unwrap(
+    int status,
+    dynamic parsed, [
+    String? fallbackMsg,
+    String? usedToken,
+  ]) {
     if (parsed is Map && parsed['ok'] == true) {
       return ApiResult(
         parsed['data'],
         (parsed['meta'] as Map?)?.cast<String, dynamic>() ?? {},
       );
     }
-    throw _error(status, parsed, fallbackMsg);
+    throw _error(status, parsed, fallbackMsg, usedToken);
   }
 
-  ApiException _error(int status, dynamic parsed, [String? fallbackMsg]) {
+  /// [usedToken] = token yang dipakai permintaan itu. Sesi dianggap hilang hanya
+  /// untuk kode sesi eksplisit DAN bila tokennya masih token saat ini (respons
+  /// telat dari sesi lama tidak boleh mengeluarkan sesi baru).
+  ApiException _error(
+    int status,
+    dynamic parsed, [
+    String? fallbackMsg,
+    String? usedToken,
+  ]) {
     if (parsed is Map && parsed['error'] is Map) {
       final e = parsed['error'] as Map;
       final err = ApiException(
@@ -155,8 +168,10 @@ class TempmailApi {
         e['details'],
       );
       if (kPublic &&
-          (kSessionLostCodes.contains(err.code) ||
-              (status == 401 && err.code == 'UNAUTHORIZED'))) {
+          kSessionLostCodes.contains(err.code) &&
+          usedToken != null &&
+          usedToken.isNotEmpty &&
+          usedToken == sessionToken) {
         onSessionLost?.call(err);
       }
       return err;
@@ -184,6 +199,7 @@ class TempmailApi {
     Object? body,
     Duration timeout = const Duration(seconds: 70),
   }) async {
+    final tok = _token;
     final (status, parsed) = await _send(
       method,
       path,
@@ -191,7 +207,7 @@ class TempmailApi {
       body: body,
       timeout: timeout,
     );
-    return _unwrap(status, parsed);
+    return _unwrap(status, parsed, null, tok);
   }
 
   Future<dynamic> get(
@@ -449,7 +465,8 @@ class TempmailApi {
 
   /// SSE: GET /v1/otp/{ref}/stream — event: ready/message/otp/ping/timeout
   Stream<Map<String, dynamic>> otpStream(String ref) async* {
-    final uri = _u('/v1/otp/${enc(ref)}/stream', {'token': _token});
+    final tok = _token;
+    final uri = _u('/v1/otp/${enc(ref)}/stream', {'token': tok});
     final res = await _guard(() async {
       final req = await _http.getUrl(uri);
       _headers.forEach(req.headers.set);
@@ -464,7 +481,7 @@ class TempmailApi {
       } catch (_) {
         parsed = text;
       }
-      throw _error(res.statusCode, parsed, 'Stream ditolak server');
+      throw _error(res.statusCode, parsed, 'Stream ditolak server', tok);
     }
     var event = 'message';
     await for (final line
@@ -547,9 +564,10 @@ class TempmailApi {
   /// GET yang mengembalikan JSON apa adanya (untuk endpoint di luar
   /// amplop {ok,data} standar, mis. ekspor favorit {version,items}).
   Future<dynamic> rawGet(String path, {Map<String, String?>? query}) async {
+    final tok = _token;
     final (status, parsed) = await _send('GET', path, query: query);
     if ((parsed is Map && parsed['error'] is Map) || status >= 400) {
-      throw _error(status, parsed, 'Permintaan gagal');
+      throw _error(status, parsed, 'Permintaan gagal', tok);
     }
     return parsed;
   }

@@ -31,8 +31,13 @@ class AuthState extends ChangeNotifier {
     return File('${dir.path}/tempmail_session.json');
   }
 
-  /// Baca sesi tersimpan. Dipakai juga di isolate latar widget.
-  Future<void> load() async {
+  /// Baca sesi tersimpan. Dipakai juga di isolate latar widget
+  /// ([background] = jangan pasang penangan "sesi dicabut": isolate latar tidak
+  /// boleh menghapus sesi milik aplikasi).
+  Future<void> load({bool background = false}) async {
+    // Isolate latar widget bisa hidup lama: selalu mulai dari kosong.
+    token = null;
+    user = null;
     try {
       final f = await _file();
       if (await f.exists()) {
@@ -42,23 +47,35 @@ class AuthState extends ChangeNotifier {
       }
     } catch (_) {}
     TempmailApi.sessionToken = token;
-    if (kPublic) TempmailApi.onSessionLost ??= handleSessionLost;
+    if (kPublic && !background) {
+      TempmailApi.onSessionLost ??= handleSessionLost;
+    }
     loaded = true;
     notifyListeners();
   }
 
-  Future<void> _save() async {
+  /// [dropped] = token yang baru dilepas: file hanya dihapus bila masih
+  /// berisi token itu (bukan sesi baru hasil login ulang).
+  Future<void> _save({String? dropped}) async {
     try {
       final f = await _file();
       if (token == null) {
-        if (await f.exists()) await f.delete();
+        if (!await f.exists()) return;
+        if (dropped != null) {
+          try {
+            final m = jsonDecode(await f.readAsString()) as Map;
+            if (m['token'] != dropped) return;
+          } catch (_) {}
+        }
+        await f.delete();
       } else {
         await f.writeAsString(jsonEncode({'token': token, 'user': user}));
       }
     } catch (_) {}
   }
 
-  Future<void> signIn(String username, String password) async {
+  /// Mengembalikan jumlah perangkat lama yang dikeluarkan server.
+  Future<int> signIn(String username, String password) async {
     final r = await api.login(
       username.trim().toLowerCase(),
       password,
@@ -73,12 +90,15 @@ class AuthState extends ChangeNotifier {
     await appState.clearActive();
     setFavoritesFrom(const []);
     notifyListeners();
+    final k = r['kicked_devices'];
+    return k is num ? k.toInt() : 0;
   }
 
   /// Keluar. [remote] = beri tahu server (logout biasa); false bila server
   /// sendiri yang sudah menolak sesi.
   Future<void> signOut({String? reason, bool remote = true}) async {
-    if (token == null) return;
+    final old = token;
+    if (old == null) return;
     if (remote) {
       try {
         await api.logout();
@@ -94,7 +114,7 @@ class AuthState extends ChangeNotifier {
     // Layar Login langsung tampil; penyimpanan menyusul.
     notifyListeners();
     setFavoritesFrom(const []);
-    await _save();
+    await _save(dropped: old);
     await appState.clearActive();
   }
 
@@ -215,8 +235,19 @@ class _LoginScreenState extends State<LoginScreen> {
       _error = null;
     });
     try {
-      await authState.signIn(u, _pass.text);
-      // AuthGate berganti ke aplikasi; info perangkat lain yang dikeluarkan.
+      final kicked = await authState.signIn(u, _pass.text);
+      // AuthGate berganti ke aplikasi; beri tahu bila HP lama dikeluarkan.
+      if (kicked > 0) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          final ctx = navigatorKey.currentContext;
+          if (ctx != null) {
+            showOk(
+              ctx,
+              'Batas perangkat tercapai: $kicked HP yang paling lama login dikeluarkan.',
+            );
+          }
+        });
+      }
     } catch (e) {
       if (mounted) setState(() => _error = errorText(e));
     } finally {
@@ -404,6 +435,12 @@ class _UnlockDialogState extends State<_UnlockDialog> {
   bool _busy = false;
   bool _show = false;
   String? _error;
+
+  @override
+  void dispose() {
+    _pw.dispose();
+    super.dispose();
+  }
 
   Future<void> _go() async {
     if (_pw.text.isEmpty || _busy) return;
@@ -648,6 +685,12 @@ class _NewPasswordDialogState extends State<_NewPasswordDialog> {
   final _c = TextEditingController();
   String? _error;
 
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
   void _ok() {
     final v = _c.text;
     if (v.isNotEmpty && (v.length < 4 || v.length > 64)) {
@@ -685,24 +728,86 @@ class _NewPasswordDialogState extends State<_NewPasswordDialog> {
 }
 
 /// Galat akses alamat dari server → tawarkan aksi yang tepat.
-/// Mengembalikan true bila pengguna berhasil membuka alamat.
-Future<bool> resolveAccessError(BuildContext context, Object e) async {
-  if (e is! ApiException) return false;
+/// Mengembalikan true bila pengguna berhasil membuka/mendaftarkan alamat.
+/// Galat yang tidak bisa ditangani (atau tanpa alamat) ditampilkan apa adanya,
+/// supaya tombol tidak pernah "diam saja". [address] = cadangan bila server
+/// tidak menyertakan details.address.
+Future<bool> resolveAccessError(
+  BuildContext context,
+  Object e, {
+  String? address,
+}) async {
+  if (e is! ApiException) {
+    showError(context, e);
+    return false;
+  }
   final d = e.details is Map ? e.details as Map : const {};
-  final address = d['address']?.toString();
-  if (address == null) return false;
-  if (e.code == 'MAILBOX_PASSWORD_REQUIRED' ||
-      (e.code == 'ADDRESS_TAKEN' && d['needs_password'] == true)) {
+  final addr = d['address']?.toString() ?? address;
+  final unlockable =
+      e.code == 'MAILBOX_PASSWORD_REQUIRED' ||
+      (e.code == 'ADDRESS_TAKEN' && d['needs_password'] == true);
+  if (addr != null && unlockable) {
     return unlockMailboxDialog(
       context,
-      address,
+      addr,
       note: d['password_changed'] == true
           ? 'Pemilik alamat ini sudah mengganti password. Masukkan password '
                 'yang baru untuk membukanya lagi.'
           : null,
     );
   }
+  if (addr != null && e.code == 'MAILBOX_UNCLAIMED') {
+    return claimMailboxDialog(context, addr);
+  }
+  showError(context, e);
   return false;
+}
+
+/// Alamat belum terdaftar (mis. dipilih dari riwayat lama) → daftarkan ke akun
+/// ini dengan password baru. Memakai jatah harian.
+Future<bool> claimMailboxDialog(BuildContext context, String address) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: const Text('Daftarkan alamat?'),
+      content: Text(
+        '$address belum terdaftar. Daftarkan ke akunmu supaya bisa dibuka '
+        '(memakai 1 jatah alamat baru hari ini). Password email dibuatkan acak.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Batal'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Daftarkan'),
+        ),
+      ],
+    ),
+  );
+  if (ok != true || !context.mounted) return false;
+  final i = address.lastIndexOf('@');
+  try {
+    final r = await api.createMailbox(
+      alias: address.substring(0, i),
+      domain: address.substring(i + 1),
+    );
+    if (r is Map) authState.applyQuota(r['quota']);
+    appState.touch();
+    if (context.mounted && r is Map && r['password'] != null) {
+      await showMailboxPasswordDialog(
+        context,
+        address,
+        password: '${r['password']}',
+        title: 'Alamat didaftarkan',
+      );
+    }
+    return true;
+  } catch (e) {
+    if (context.mounted) await resolveAccessError(context, e, address: address);
+    return false;
+  }
 }
 
 // ============================ AKUN ============================
@@ -724,6 +829,7 @@ class _AccountScreenState extends State<AccountScreen> {
   }
 
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -961,6 +1067,14 @@ class _ChangeAccountPasswordDialogState
   bool _busy = false;
   String? _error;
 
+  @override
+  void dispose() {
+    _cur.dispose();
+    _next.dispose();
+    _again.dispose();
+    super.dispose();
+  }
+
   Future<void> _go() async {
     if (_next.text.length < 6) {
       setState(() => _error = 'Password baru minimal 6 karakter.');
@@ -1065,6 +1179,7 @@ class _MyMailboxesScreenState extends State<MyMailboxesScreen> {
   }
 
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -1171,6 +1286,7 @@ class _MyMailboxesScreenState extends State<MyMailboxesScreen> {
               controller: _q,
               textInputAction: TextInputAction.search,
               onSubmitted: (_) => _load(),
+              onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
                 hintText: 'Cari alamat',
                 prefixIcon: const Icon(Icons.search),

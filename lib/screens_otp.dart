@@ -132,7 +132,9 @@ class _OtpScreenState extends State<OtpScreen> {
     otpCommand.removeListener(_onCommand);
     Notifier.instance.clearWaiting();
     _sub?.cancel();
-    _waitTick?.cancel();
+    // Hentikan juga polling inbox saat menunggu (mis. layar ditutup karena logout).
+    _waitGen++;
+    _stopWaitTick();
     _timeoutCtl.dispose();
     _refsCtl.dispose();
     _extractCtl.dispose();

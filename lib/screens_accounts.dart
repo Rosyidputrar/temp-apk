@@ -93,6 +93,7 @@ class _AccountsAdminScreenState extends State<AccountsAdminScreen> {
   }
 
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -320,7 +321,10 @@ class _UserFormDialogState extends State<_UserFormDialog> {
     final now = DateTime.now();
     final d = await showDatePicker(
       context: context,
-      initialDate: _expiry ?? now.add(const Duration(days: 30)),
+      // masa aktif lama yang sudah lewat → mulai dari hari ini (perpanjangan)
+      initialDate: _expiry == null || _expiry!.isBefore(now)
+          ? now.add(const Duration(days: 30))
+          : _expiry!,
       firstDate: now,
       lastDate: DateTime(now.year + 10),
       helpText: 'Aktif sampai',
@@ -522,6 +526,7 @@ class _UserDetailScreenState extends State<UserDetailScreen> {
   }
 
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -828,6 +833,7 @@ class _RegisteredMailboxesScreenState extends State<RegisteredMailboxesScreen> {
   }
 
   Future<void> _load() async {
+    if (!mounted) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -944,8 +950,19 @@ class _MailboxTile extends StatelessWidget {
     );
     if (owner == null || owner.isEmpty) return;
     try {
-      await api.adminPatchMailbox(address, owner: owner);
-      if (context.mounted) showOk(context, '$address kini milik $owner');
+      final r = await api.adminPatchMailbox(address, owner: owner);
+      if (!context.mounted) return;
+      // Pindah pemilik = password email dirotasi; berikan ke pemilik baru.
+      if (r is Map && r['password'] != null) {
+        await showMailboxPasswordDialog(
+          context,
+          address,
+          password: '${r['password']}',
+          title: 'Kini milik $owner',
+        );
+      } else {
+        showOk(context, '$address kini milik $owner');
+      }
       onChanged();
     } catch (e) {
       if (context.mounted) showError(context, e);

@@ -66,7 +66,8 @@ jobs:
       - name: Build APK admin
         env:
           API_TOKEN: ${{ secrets.API_TOKEN }}
-          UPDATE_REPO: ${{ vars.ADMIN_UPDATE_REPO || github.repository }}
+          # Kosong = pembaruan di aplikasi admin dimatikan (rilis admin tidak boleh di repo publik).
+          UPDATE_REPO: ${{ vars.ADMIN_UPDATE_REPO || (github.event.repository.private && github.repository || '') }}
         run: |
           if [ -z "$API_TOKEN" ]; then
             echo "::warning::Secret API_TOKEN kosong — APK admin tidak bisa memanggil server."
@@ -114,12 +115,35 @@ jobs:
         env:
           API_TOKEN: ${{ secrets.API_TOKEN }}
 
+      # Artifact repo publik bisa diunduh siapa pun yang login GitHub → APK admin (berisi token)
+      # hanya diunggah polos bila repo PRIVAT. Di repo publik dibungkus 7z AES-256 dengan
+      # passphrase secrets.ADMIN_ARTIFACT_PASSWORD; tanpa secret itu tidak diunggah sama sekali.
+      - name: Siapkan APK admin untuk diunggah
+        id: admart
+        env:
+          PASS: ${{ secrets.ADMIN_ARTIFACT_PASSWORD }}
+          IS_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          mkdir -p dist/admin-upload
+          if [ "$IS_PRIVATE" = "true" ]; then
+            cp dist/admin/*.apk dist/admin-upload/
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$PASS" ]; then
+            7z a -t7z -mhe=on -p"$PASS" dist/admin-upload/tempmail-admin-${{ github.run_number }}.7z ./dist/admin/*.apk > /dev/null
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Repo publik & secret ADMIN_ARTIFACT_PASSWORD belum ada — APK admin TIDAK diunggah (berisi token admin)."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Unggah APK admin (artifact)
+        if: steps.admart.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: tempmail-admin-${{ github.run_number }}
-          path: dist/admin/*.apk
+          path: dist/admin-upload/*
           if-no-files-found: error
+          retention-days: 7
 
       - name: Unggah APK publik (artifact)
         uses: actions/upload-artifact@v4
@@ -141,7 +165,7 @@ jobs:
 
       - name: Lewati release admin (repo publik)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.private
-        run: echo "::warning::Repo ini publik — APK admin TIDAK dirilis (berisi token admin). Ambil dari artifact tempmail-admin-${{ github.run_number }}."
+        run: echo "::warning::Repo ini publik — APK admin TIDAK dirilis (berisi token admin). Ambil dari artifact tempmail-admin-${{ github.run_number }} (7z berpassword ADMIN_ARTIFACT_PASSWORD)."
 
       # Release APK publik ke repo rilis publik (default seseegy/temp-p, bisa diganti lewat
       # vars.PUBLIC_RELEASE_REPO). Butuh secrets.PUBLIC_RELEASE_TOKEN = fine-grained PAT

@@ -296,9 +296,9 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       // Sudah dipakai akun lain → tawarkan buka dengan password-nya.
       final d = e.details is Map ? e.details as Map : const {};
-      if (e.code == 'ADDRESS_TAKEN' && d['needs_password'] == true) {
-        if (await resolveAccessError(context, e)) {
-          final a = '${d['address']}';
+      if (e.code == 'ADDRESS_TAKEN') {
+        final a = d['address']?.toString();
+        if (await resolveAccessError(context, e, address: a) && a != null) {
           await appState.setActive(a, a);
           if (mounted) showOk(context, 'Alamat dibuka: $a');
         }
@@ -539,9 +539,14 @@ class _HomeScreenState extends State<HomeScreen> {
                         _AccessBanner(
                           error: _accessError!,
                           onUnlock: () async {
+                            if (_accessError!.code == 'MAILBOX_LOCKED') {
+                              await appState.clearActive();
+                              return;
+                            }
                             if (await resolveAccessError(
                               context,
                               _accessError!,
+                              address: addr,
                             )) {
                               _loadInfo(showErrors: true);
                             }
@@ -785,7 +790,13 @@ class _AccessBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = Theme.of(context).colorScheme;
-    final canUnlock = error.code == 'MAILBOX_PASSWORD_REQUIRED';
+    final (label, icon) = switch (error.code) {
+      'MAILBOX_PASSWORD_REQUIRED' => ('Masukkan password', Icons.key),
+      'MAILBOX_UNCLAIMED' => ('Daftarkan ke akunku', Icons.add_task),
+      'MAILBOX_LOCKED' => ('Pilih alamat lain', Icons.swap_horiz),
+      _ => ('', Icons.error_outline),
+    };
+    final canUnlock = label.isNotEmpty;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -800,8 +811,8 @@ class _AccessBanner extends StatelessWidget {
             const SizedBox(height: 8),
             FilledButton.icon(
               onPressed: onUnlock,
-              icon: const Icon(Icons.key, size: 18),
-              label: const Text('Masukkan password'),
+              icon: Icon(icon, size: 18),
+              label: Text(label),
             ),
           ],
         ],

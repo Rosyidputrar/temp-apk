@@ -605,12 +605,8 @@ class _VariantsScreenState extends State<VariantsScreen> {
         if (r is Map) authState.applyQuota(r['quota']);
       } on ApiException catch (e) {
         if (!mounted) return;
-        if (e.code == 'ADDRESS_TAKEN') {
-          if (!await resolveAccessError(context, e)) return;
-        } else {
-          showError(context, e);
-          return;
-        }
+        // Dipakai akun lain → tawarkan password; selain itu tampilkan galatnya.
+        if (!await resolveAccessError(context, e, address: address)) return;
       }
     }
     await appState.setActive(address, address);
@@ -2506,11 +2502,14 @@ class _AboutScreenState extends State<AboutScreen> {
     } catch (e) {
       if (mounted) setState(() => _healthErr = errorText(e));
     }
-    try {
-      final m = await api.me();
-      if (mounted) setState(() => _me = m);
-    } catch (e) {
-      if (mounted) showError(context, e);
+    // Info server mentah hanya ditampilkan di APK admin.
+    if (!kPublic) {
+      try {
+        final m = await api.me();
+        if (mounted) setState(() => _me = m);
+      } catch (e) {
+        if (mounted) showError(context, e);
+      }
     }
     if (mounted) setState(() => _loading = false);
   }
@@ -2562,7 +2561,9 @@ class _AboutScreenState extends State<AboutScreen> {
                   subtitle: Text(
                     _healthErr ??
                         (kPublic
-                            ? 'Layanan email berjalan normal'
+                            ? (h is Map && h['status'] == 'degraded'
+                                  ? 'Layanan email sedang terganggu, coba lagi nanti'
+                                  : 'Layanan email berjalan normal')
                             : up != null
                             ? 'Upstream ${up['ok'] == true ? 'OK' : 'GAGAL'}'
                                   '${up['ms'] != null ? ' · ${up['ms']} ms' : ''}'

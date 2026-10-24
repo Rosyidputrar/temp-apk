@@ -199,10 +199,43 @@ void main() {
   // Setelah frame pertama: notifikasi & cek pembaruan (tidak memblokir UI).
   Notifier.instance.addListener(_onNotificationAction);
   WidgetsBinding.instance.addPostFrameCallback((_) async {
+    if (await _flavorMismatch()) return;
     await Notifier.instance.init();
     await UpdateService.instance.init();
     await HomeWidgets.init();
   });
+}
+
+/// Penjaga salah build: --flavor public wajib bersama PUBLIC_BUILD=true (dan
+/// sebaliknya). Kalau tidak, APK ".public" bisa berperilaku seperti APK admin.
+Future<bool> _flavorMismatch() async {
+  if (!Platform.isAndroid) return false;
+  try {
+    final info = await _appChannel.invokeMapMethod<String, dynamic>('info');
+    final pkg = '${info?['package'] ?? ''}';
+    if (pkg.isEmpty || pkg.endsWith('.public') == kPublic) return false;
+  } catch (_) {
+    return false;
+  }
+  runApp(
+    const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        body: Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'Build APK tidak valid: flavor dan PUBLIC_BUILD tidak cocok. '
+              'Build ulang dengan --flavor public --dart-define=PUBLIC_BUILD=true '
+              '(atau --flavor admin tanpa PUBLIC_BUILD).',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  return true;
 }
 
 class TempMailApp extends StatelessWidget {

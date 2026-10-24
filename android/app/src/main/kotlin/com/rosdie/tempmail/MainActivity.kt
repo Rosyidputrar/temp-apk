@@ -34,6 +34,7 @@ class MainActivity : FlutterActivity() {
                                     "versionCode" to code,
                                     "abis" to Build.SUPPORTED_ABIS.toList(),
                                     "sdk" to Build.VERSION.SDK_INT,
+                                    "package" to packageName,
                                     // nama perangkat di daftar sesi akun (APK publik)
                                     "model" to listOf(Build.MANUFACTURER, Build.MODEL)
                                         .filter { !it.isNullOrBlank() }
