@@ -51,6 +51,23 @@ android {
         versionName = flutter.versionName
     }
 
+    // Dua APK yang bisa terpasang berdampingan:
+    //  admin  : com.rosdie.tempmail        "TempMail Admin" (token admin bawaan)
+    //  public : com.rosdie.tempmail.public "TempMail"       (login akun dari admin)
+    // Build: flutter build apk --flavor admin|public (public + --dart-define=PUBLIC_BUILD=true)
+    flavorDimensions += "edition"
+    productFlavors {
+        create("admin") {
+            dimension = "edition"
+            manifestPlaceholders["appLabel"] = "TempMail Admin"
+        }
+        create("public") {
+            dimension = "edition"
+            applicationIdSuffix = ".public"
+            manifestPlaceholders["appLabel"] = "TempMail"
+        }
+    }
+
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName(if (hasReleaseKeystore) "release" else "debug")

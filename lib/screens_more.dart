@@ -5,8 +5,10 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 
+import 'account.dart';
 import 'api.dart';
 import 'main.dart';
+import 'screens_accounts.dart';
 import 'update.dart';
 import 'screens_main.dart' show fmtTime, parseApiTime;
 
@@ -407,10 +409,33 @@ class MoreScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = <(IconData, String, String, Widget)>[
+      if (kPublic) ...[
+        (
+          Icons.account_circle_outlined,
+          'Akun',
+          'Kuota harian, perangkat, ganti password, keluar',
+          const AccountScreen(),
+        ),
+        (
+          Icons.alternate_email,
+          'Alamat saya',
+          'Alamat milikmu + yang dibuka dengan password',
+          const MyMailboxesScreen(),
+        ),
+      ],
+      if (!kPublic)
+        (
+          Icons.manage_accounts_outlined,
+          'Kelola akun',
+          'Akun APK publik, kuota, perangkat, alamat terdaftar',
+          const AccountsAdminScreen(),
+        ),
       (
         Icons.call_split,
         'Varian alamat',
-        'Titik & plus dari alamat aktif',
+        kPublic
+            ? 'Varian titik dari alamat aktif'
+            : 'Titik & plus dari alamat aktif',
         const VariantsScreen(),
       ),
       (
@@ -419,16 +444,19 @@ class MoreScreen extends StatelessWidget {
         'Dari alamat @gmail.com mana pun',
         const GmailVariantsScreen(),
       ),
-      (
-        Icons.list_alt,
-        'Alias (alias.md)',
-        'Lihat, edit, validasi daftar alias',
-        const AliasScreen(),
-      ),
+      if (!kPublic)
+        (
+          Icons.list_alt,
+          'Alias (alias.md)',
+          'Lihat, edit, validasi daftar alias',
+          const AliasScreen(),
+        ),
       (
         Icons.language,
         'Domain',
-        'Cari, acak, grup, dan uji domain',
+        kPublic
+            ? 'Daftar domain yang bisa dipakai'
+            : 'Cari, acak, grup, dan uji domain',
         const DomainsScreen(),
       ),
       (
@@ -437,24 +465,26 @@ class MoreScreen extends StatelessWidget {
         'Alamat baru dipakai + feed aktivitas',
         const HistoryScreen(),
       ),
-      (
-        Icons.visibility_outlined,
-        'Pantauan & notifikasi',
-        'Watch OTP/link + tes notifikasi',
-        const WatchScreen(),
-      ),
-      (
-        Icons.bug_report_outlined,
-        'Debug',
-        'Diagnosis upstream per alamat',
-        const DebugScreen(),
-      ),
-      (
-        Icons.admin_panel_settings_outlined,
-        'Admin',
-        'Log, config, domain & pola OTP kustom',
-        const AdminScreen(),
-      ),
+      if (!kPublic) ...[
+        (
+          Icons.visibility_outlined,
+          'Pantauan & notifikasi',
+          'Watch OTP/link + tes notifikasi',
+          const WatchScreen(),
+        ),
+        (
+          Icons.bug_report_outlined,
+          'Debug',
+          'Diagnosis upstream per alamat',
+          const DebugScreen(),
+        ),
+        (
+          Icons.admin_panel_settings_outlined,
+          'Admin',
+          'Log, config, domain & pola OTP kustom',
+          const AdminScreen(),
+        ),
+      ],
       (
         Icons.system_update_outlined,
         'Pembaruan aplikasi',
@@ -464,7 +494,9 @@ class MoreScreen extends StatelessWidget {
       (
         Icons.info_outline,
         'Tentang & status',
-        'Info server /me + health',
+        kPublic
+            ? 'Versi aplikasi & status layanan'
+            : 'Info server /me + health',
         const AboutScreen(),
       ),
     ];
@@ -552,7 +584,35 @@ class _VariantsScreenState extends State<VariantsScreen> {
   }
 
   /// Varian titik: inbox-nya sama dengan alamat varian → langsung pakai.
+  /// APK publik: alamat varian didaftarkan dulu ke akun (memakai jatah
+  /// harian); password-nya disamakan dengan alamat dasar bila kita pemiliknya.
   Future<void> _useDot(String address) async {
+    if (kPublic) {
+      final base = appState.activeRef;
+      final i = address.lastIndexOf('@');
+      try {
+        String? pw;
+        if (base != null) {
+          try {
+            pw = (await api.mailboxPassword(base))['password']?.toString();
+          } catch (_) {}
+        }
+        final r = await api.createMailbox(
+          alias: address.substring(0, i),
+          domain: address.substring(i + 1),
+          password: pw,
+        );
+        if (r is Map) authState.applyQuota(r['quota']);
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        if (e.code == 'ADDRESS_TAKEN') {
+          if (!await resolveAccessError(context, e)) return;
+        } else {
+          showError(context, e);
+          return;
+        }
+      }
+    }
     await appState.setActive(address, address);
     if (mounted) await copyText(context, address, 'Aktif & disalin: $address');
   }
@@ -688,18 +748,27 @@ class _VariantsScreenState extends State<VariantsScreen> {
             style: const TextStyle(fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 10),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'dot', label: Text('Titik')),
-              ButtonSegment(value: 'plus', label: Text('Plus')),
-              ButtonSegment(value: 'both', label: Text('Keduanya')),
-            ],
-            selected: {_mode},
-            onSelectionChanged: (v) {
-              setState(() => _mode = v.first);
-              _load();
-            },
-          ),
+          if (kPublic)
+            Text(
+              'Varian titik = alamat terpisah dengan inbox sendiri. '
+              '"Pakai" mendaftarkannya ke akunmu (memakai jatah harian).',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            )
+          else
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'dot', label: Text('Titik')),
+                ButtonSegment(value: 'plus', label: Text('Plus')),
+                ButtonSegment(value: 'both', label: Text('Keduanya')),
+              ],
+              selected: {_mode},
+              onSelectionChanged: (v) {
+                setState(() => _mode = v.first);
+                _load();
+              },
+            ),
           if (_mode != 'dot') ...[
             const SizedBox(height: 10),
             TextField(
@@ -861,18 +930,20 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
             ),
           ),
           const SizedBox(height: 10),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'dot', label: Text('Titik')),
-              ButtonSegment(value: 'plus', label: Text('Plus')),
-              ButtonSegment(value: 'both', label: Text('Keduanya')),
-            ],
-            selected: {_mode},
-            onSelectionChanged: (v) {
-              setState(() => _mode = v.first);
-              if (_items.isNotEmpty) _load();
-            },
-          ),
+          // APK publik: hanya varian titik (varian plus memakai alias.md admin).
+          if (!kPublic)
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'dot', label: Text('Titik')),
+                ButtonSegment(value: 'plus', label: Text('Plus')),
+                ButtonSegment(value: 'both', label: Text('Keduanya')),
+              ],
+              selected: {_mode},
+              onSelectionChanged: (v) {
+                setState(() => _mode = v.first);
+                if (_items.isNotEmpty) _load();
+              },
+            ),
           if (_mode == 'dot')
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
@@ -2490,25 +2561,36 @@ class _AboutScreenState extends State<AboutScreen> {
                   ),
                   subtitle: Text(
                     _healthErr ??
-                        (up != null
+                        (kPublic
+                            ? 'Layanan email berjalan normal'
+                            : up != null
                             ? 'Upstream ${up['ok'] == true ? 'OK' : 'GAGAL'}'
                                   '${up['ms'] != null ? ' · ${up['ms']} ms' : ''}'
                                   '${h is Map && h.containsKey('kv') ? ' · KV ${h['kv'] == true || h['kv'] is Map ? 'OK' : 'GAGAL'}' : ''}'
                             : kApiBase),
                   ),
                 ),
-                ListTile(
-                  leading: Icon(
-                    kApiToken.isEmpty ? Icons.key_off_outlined : Icons.key,
-                    color: kApiToken.isEmpty ? s.error : null,
+                if (kPublic)
+                  ListTile(
+                    leading: const Icon(Icons.account_circle_outlined),
+                    title: Text('Masuk sebagai ${authState.username ?? '-'}'),
+                    subtitle: Text(expiryText(authState.user?['expires_at'])),
+                  )
+                else
+                  ListTile(
+                    leading: Icon(
+                      kApiToken.isEmpty ? Icons.key_off_outlined : Icons.key,
+                      color: kApiToken.isEmpty ? s.error : null,
+                    ),
+                    title: Text(
+                      kApiToken.isEmpty
+                          ? 'Token API belum disuntik'
+                          : 'Token API terpasang',
+                    ),
+                    subtitle: const Text(
+                      'Disuntik saat build via --dart-define',
+                    ),
                   ),
-                  title: Text(
-                    kApiToken.isEmpty
-                        ? 'Token API belum disuntik'
-                        : 'Token API terpasang',
-                  ),
-                  subtitle: const Text('Disuntik saat build via --dart-define'),
-                ),
                 ListTile(
                   leading: const Icon(Icons.system_update_outlined),
                   title: Text(
@@ -2526,15 +2608,18 @@ class _AboutScreenState extends State<AboutScreen> {
               ],
             ),
           ),
-          const SizedBox(height: 12),
-          _heading('Server'),
-          SelectableText(kApiBase),
-          const SizedBox(height: 12),
-          _heading('Health'),
-          if (h != null) JsonView(h),
-          const SizedBox(height: 12),
-          _heading('Info server (/v1/me)'),
-          if (_me != null) JsonView(_me),
+          // Detail teknis server hanya untuk APK admin.
+          if (!kPublic) ...[
+            const SizedBox(height: 12),
+            _heading('Server'),
+            SelectableText(kApiBase),
+            const SizedBox(height: 12),
+            _heading('Health'),
+            if (h != null) JsonView(h),
+            const SizedBox(height: 12),
+            _heading('Info server (/v1/me)'),
+            if (_me != null) JsonView(_me),
+          ],
         ],
       ),
     );

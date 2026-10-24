@@ -12,12 +12,15 @@ import 'dart:io';
 import 'package:flutter/widgets.dart';
 import 'package:home_widget/home_widget.dart';
 
+import 'account.dart';
 import 'api.dart';
 import 'main.dart';
 import 'otp_detect.dart';
 
-const kOtpWidget = 'OtpWidgetProvider';
-const kQuickWidget = 'QuickWidgetProvider';
+// Nama kelas lengkap: APK publik punya applicationId berakhiran ".public",
+// sedangkan kelas widget tetap di paket com.rosdie.tempmail.
+const kOtpWidget = 'com.rosdie.tempmail.OtpWidgetProvider';
+const kQuickWidget = 'com.rosdie.tempmail.QuickWidgetProvider';
 
 String _hhmm(DateTime t) {
   final l = t.toLocal();
@@ -32,8 +35,8 @@ Future<void> _save(Map<String, String?> data) async {
 }
 
 Future<void> _refreshWidgets({bool otp = true, bool quick = false}) async {
-  if (otp) await HomeWidget.updateWidget(androidName: kOtpWidget);
-  if (quick) await HomeWidget.updateWidget(androidName: kQuickWidget);
+  if (otp) await HomeWidget.updateWidget(qualifiedAndroidName: kOtpWidget);
+  if (quick) await HomeWidget.updateWidget(qualifiedAndroidName: kQuickWidget);
 }
 
 class HomeWidgets {
@@ -176,6 +179,17 @@ String _otpInfo(
 @pragma('vm:entry-point')
 Future<void> homeWidgetCallback(Uri? uri) async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Isolate latar tidak berbagi memori dengan aplikasi: baca sesi akun dulu.
+  if (kPublic) {
+    await authState.load();
+    if (!authState.signedIn) {
+      await _save({
+        'otp_info': 'Belum login — buka TempMail',
+        'quick_status': 'Belum login — buka TempMail',
+      });
+      return _refreshWidgets(quick: true);
+    }
+  }
   switch (uri?.host) {
     case 'refresh':
       await _bgRefresh();

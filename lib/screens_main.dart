@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import 'account.dart';
 import 'api.dart';
 import 'main.dart';
 import 'otp_detect.dart';
@@ -126,10 +127,17 @@ class _HomeScreenState extends State<HomeScreen> {
   dynamic _lastCreated;
   dynamic _info;
   String? _infoRef;
+  // Galat akses alamat aktif (password diganti pemilik, dikunci, dll.).
+  ApiException? _accessError;
   Map<String, int> _groupCounts = {};
   bool _refreshing = false;
 
   static const _quickGroups = ['premium', 'basic', 'standard', 'semua'];
+  static const _kAccessCodes = {
+    'MAILBOX_PASSWORD_REQUIRED',
+    'MAILBOX_LOCKED',
+    'MAILBOX_UNCLAIMED',
+  };
 
   // Tiga tombol sebaris di layar sempit: padding kecil agar label tidak patah.
   static final _compact = FilledButton.styleFrom(
@@ -168,6 +176,7 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() {
       // Info milik alamat lama jangan ikut tampil di alamat baru.
       if (_infoRef != appState.activeRef) _info = null;
+      _accessError = null;
     });
     _loadInfo();
   }
@@ -190,9 +199,17 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() {
           _info = info;
           _infoRef = ref;
+          _accessError = null;
         });
       }
     } catch (e) {
+      if (mounted &&
+          appState.activeRef == ref &&
+          e is ApiException &&
+          _kAccessCodes.contains(e.code)) {
+        setState(() => _accessError = e);
+        return;
+      }
       if (showErrors && mounted) showError(context, e);
     }
   }
@@ -240,16 +257,32 @@ class _HomeScreenState extends State<HomeScreen> {
           alias: alias,
           domain: _domain.text.trim(),
           group: _group.text.trim(),
-          saveAs: _saveAs.text.trim(),
+          // APK publik: kolom ini = password email; admin: simpan sbg alias.
+          saveAs: kPublic ? null : _saveAs.text.trim(),
+          password: kPublic ? _saveAs.text : null,
           exclude: alias.isEmpty && cur != null ? [cur] : null,
-          check: true,
+          check: !kPublic,
         );
       }
       final address = r['address'].toString();
       final ref = (r['ref'] ?? r['saved_as'] ?? address).toString();
       await appState.setActive(ref, address);
+      if (r is Map) authState.applyQuota(r['quota']);
       if (!mounted) return;
       setState(() => _lastCreated = r);
+      // Alamat custom di APK publik: tunjukkan password-nya sekali di depan.
+      if (kPublic && quickGroup == null && r is Map && r['password'] != null) {
+        _saveAs.clear();
+        await showMailboxPasswordDialog(
+          context,
+          address,
+          password: '${r['password']}',
+          title: r['created'] == false
+              ? 'Alamat ini sudah milikmu'
+              : 'Alamat dibuat',
+        );
+        if (!mounted) return;
+      }
       final ws = r is Map ? listOf(r['warnings']) : const [];
       // Satu snackbar saja: catatan server tidak menimpa konfirmasi salin.
       await copyText(
@@ -259,6 +292,19 @@ class _HomeScreenState extends State<HomeScreen> {
             ? 'Alamat aktif & disalin: $address'
             : 'Alamat aktif & disalin: $address\nCatatan: ${ws.join(' • ')}',
       );
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      // Sudah dipakai akun lain → tawarkan buka dengan password-nya.
+      final d = e.details is Map ? e.details as Map : const {};
+      if (e.code == 'ADDRESS_TAKEN' && d['needs_password'] == true) {
+        if (await resolveAccessError(context, e)) {
+          final a = '${d['address']}';
+          await appState.setActive(a, a);
+          if (mounted) showOk(context, 'Alamat dibuka: $a');
+        }
+        return;
+      }
+      showError(context, e);
     } catch (e) {
       if (mounted) showError(context, e);
     } finally {
@@ -269,6 +315,17 @@ class _HomeScreenState extends State<HomeScreen> {
         });
       }
     }
+  }
+
+  /// Pilih domain dari daftar server (APK publik hanya boleh domain terdaftar).
+  Future<void> _pickDomain() async {
+    final d = await showModalBottomSheet<String>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (_) => const _DomainPicker(),
+    );
+    if (d != null) setState(() => _domain.text = d);
   }
 
   Future<void> _action(String kind) async {
@@ -329,6 +386,36 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  Widget _groupField() => TextField(
+    controller: _group,
+    textInputAction: TextInputAction.next,
+    autocorrect: false,
+    decoration: const InputDecoration(
+      labelText: 'Grup domain',
+      hintText: 'premium / basic / standard',
+      prefixIcon: Icon(Icons.folder_outlined),
+    ),
+  );
+
+  /// Admin: simpan sbg alias (alias.md). Publik: password email.
+  Widget _secondField() => TextField(
+    controller: _saveAs,
+    autocorrect: false,
+    enableSuggestions: !kPublic,
+    textInputAction: TextInputAction.done,
+    onSubmitted: (_) => _busy ? null : _create(),
+    decoration: InputDecoration(
+      labelText: kPublic ? 'Password email' : 'Simpan sbg alias',
+      hintText: kPublic ? 'Kosongkan untuk dibuatkan acak' : null,
+      prefixIcon: Icon(kPublic ? Icons.key_outlined : Icons.bookmark_outline),
+    ),
+  );
+
+  /// Akses ke alamat aktif menurut server: owner | shared | admin.
+  String? get _access => _info is Map && _infoRef == appState.activeRef
+      ? (_info as Map)['access']?.toString()
+      : null;
+
   String _countLabel() {
     final i = _info;
     if (i is! Map) return '';
@@ -366,7 +453,7 @@ class _HomeScreenState extends State<HomeScreen> {
           padding: const EdgeInsets.all(16),
           children: [
             const UpdateBanner(),
-            if (kApiToken.isEmpty) ...[
+            if (!kPublic && kApiToken.isEmpty) ...[
               Card(
                 color: s.errorContainer,
                 child: ListTile(
@@ -439,6 +526,28 @@ class _HomeScreenState extends State<HomeScreen> {
                             style: TextStyle(color: s.onSurfaceVariant),
                           ),
                         ),
+                      if (_access == 'shared')
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'Milik akun lain (dibuka dengan password)',
+                            style: TextStyle(color: s.onSurfaceVariant),
+                          ),
+                        ),
+                      if (_accessError != null) ...[
+                        const SizedBox(height: 10),
+                        _AccessBanner(
+                          error: _accessError!,
+                          onUnlock: () async {
+                            if (await resolveAccessError(
+                              context,
+                              _accessError!,
+                            )) {
+                              _loadInfo(showErrors: true);
+                            }
+                          },
+                        ),
+                      ],
                       const SizedBox(height: 12),
                       Row(
                         children: [
@@ -472,49 +581,59 @@ class _HomeScreenState extends State<HomeScreen> {
                         ],
                       ),
                       const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 8,
-                        children: [
-                          if (isFavorite(addr))
-                            FilledButton.tonalIcon(
-                              onPressed: () => _action('fav'),
-                              icon: const Icon(Icons.star, size: 18),
-                              label: const Text('Favorit'),
-                            )
-                          else
+                      // Alamat tidak bisa dibuka → aksi lain tidak berguna.
+                      if (_accessError == null)
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            if (isFavorite(addr))
+                              FilledButton.tonalIcon(
+                                onPressed: () => _action('fav'),
+                                icon: const Icon(Icons.star, size: 18),
+                                label: const Text('Favorit'),
+                              )
+                            else
+                              OutlinedButton.icon(
+                                onPressed: () => _action('fav'),
+                                icon: const Icon(Icons.star_outline, size: 18),
+                                label: const Text('Favoritkan'),
+                              ),
                             OutlinedButton.icon(
-                              onPressed: () => _action('fav'),
-                              icon: const Icon(Icons.star_outline, size: 18),
-                              label: const Text('Favoritkan'),
+                              onPressed: () => _action('read'),
+                              icon: const Icon(Icons.done_all, size: 18),
+                              label: const Text('Tandai dibaca'),
                             ),
-                          OutlinedButton.icon(
-                            onPressed: () => _action('read'),
-                            icon: const Icon(Icons.done_all, size: 18),
-                            label: const Text('Tandai dibaca'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: () => _action('cache'),
-                            icon: const Icon(
-                              Icons.cleaning_services_outlined,
-                              size: 18,
+                            OutlinedButton.icon(
+                              onPressed: () => _action('cache'),
+                              icon: const Icon(
+                                Icons.cleaning_services_outlined,
+                                size: 18,
+                              ),
+                              label: const Text('Bersih cache'),
                             ),
-                            label: const Text('Bersih cache'),
-                          ),
-                          OutlinedButton.icon(
-                            onPressed: () => _action('wipe'),
-                            icon: Icon(
-                              Icons.delete_forever_outlined,
-                              size: 18,
-                              color: s.error,
-                            ),
-                            label: Text(
-                              'Hapus inbox',
-                              style: TextStyle(color: s.error),
-                            ),
-                          ),
-                        ],
-                      ),
+                            if (_access == 'owner' || _access == 'admin')
+                              OutlinedButton.icon(
+                                onPressed: () =>
+                                    showMailboxPasswordDialog(context, addr),
+                                icon: const Icon(Icons.key_outlined, size: 18),
+                                label: const Text('Password'),
+                              ),
+                            if (_access != 'shared')
+                              OutlinedButton.icon(
+                                onPressed: () => _action('wipe'),
+                                icon: Icon(
+                                  Icons.delete_forever_outlined,
+                                  size: 18,
+                                  color: s.error,
+                                ),
+                                label: Text(
+                                  'Hapus inbox',
+                                  style: TextStyle(color: s.error),
+                                ),
+                              ),
+                          ],
+                        ),
                     ],
                   ],
                 ),
@@ -530,6 +649,20 @@ class _HomeScreenState extends State<HomeScreen> {
               'Alamat acak per jenis domain, langsung aktif & disalin.',
               style: TextStyle(color: s.onSurfaceVariant),
             ),
+            if (kPublic)
+              ListenableBuilder(
+                listenable: authState,
+                builder: (context, _) => Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    'Jatah hari ini: ${quotaText(authState.user)} alamat baru',
+                    style: TextStyle(
+                      color: s.onSurfaceVariant,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
             const SizedBox(height: 8),
             Wrap(
               spacing: 8,
@@ -562,7 +695,9 @@ class _HomeScreenState extends State<HomeScreen> {
               textInputAction: TextInputAction.next,
               autocorrect: false,
               decoration: const InputDecoration(
-                labelText: 'Alias (kosong = acak dari alias.md)',
+                labelText: kPublic
+                    ? 'Alias (kosong = acak)'
+                    : 'Alias (kosong = acak dari alias.md)',
                 prefixIcon: Icon(Icons.person_outline),
               ),
             ),
@@ -572,40 +707,32 @@ class _HomeScreenState extends State<HomeScreen> {
               textInputAction: TextInputAction.next,
               autocorrect: false,
               keyboardType: TextInputType.url,
-              decoration: const InputDecoration(
-                labelText: 'Domain (opsional)',
-                prefixIcon: Icon(Icons.language),
+              decoration: InputDecoration(
+                labelText: kPublic
+                    ? 'Domain (kosong = acak)'
+                    : 'Domain (opsional)',
+                prefixIcon: const Icon(Icons.language),
+                suffixIcon: IconButton(
+                  tooltip: 'Pilih dari daftar domain',
+                  onPressed: _pickDomain,
+                  icon: const Icon(Icons.list),
+                ),
               ),
             ),
             const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _group,
-                    textInputAction: TextInputAction.next,
-                    autocorrect: false,
-                    decoration: const InputDecoration(
-                      labelText: 'Grup domain',
-                      prefixIcon: Icon(Icons.folder_outlined),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: TextField(
-                    controller: _saveAs,
-                    autocorrect: false,
-                    textInputAction: TextInputAction.done,
-                    onSubmitted: (_) => _busy ? null : _create(),
-                    decoration: const InputDecoration(
-                      labelText: 'Simpan sbg alias',
-                      prefixIcon: Icon(Icons.bookmark_outline),
-                    ),
-                  ),
-                ),
-              ],
-            ),
+            // APK publik: password email butuh ruang → satu baris sendiri.
+            if (kPublic) ...[
+              _groupField(),
+              const SizedBox(height: 10),
+              _secondField(),
+            ] else
+              Row(
+                children: [
+                  Expanded(child: _groupField()),
+                  const SizedBox(width: 10),
+                  Expanded(child: _secondField()),
+                ],
+              ),
             const SizedBox(height: 14),
             FilledButton.icon(
               onPressed: _busy ? null : () => _create(),
@@ -618,7 +745,15 @@ class _HomeScreenState extends State<HomeScreen> {
                   : const Icon(Icons.add),
               label: const Text('Buat alamat'),
             ),
-            if (_lastCreated != null) ...[
+            if (kPublic) ...[
+              const SizedBox(height: 10),
+              Text(
+                'Setiap alamat punya password. Orang lain hanya bisa membaca '
+                'inbox-mu bila tahu password-nya.',
+                style: TextStyle(color: s.onSurfaceVariant, fontSize: 12),
+              ),
+            ],
+            if (!kPublic && _lastCreated != null) ...[
               const SizedBox(height: 12),
               Theme(
                 data: Theme.of(context)
@@ -641,6 +776,136 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 // ============================ INBOX ============================
+/// Alamat aktif tidak bisa dibuka (password diganti / dikunci / belum terdaftar).
+class _AccessBanner extends StatelessWidget {
+  final ApiException error;
+  final VoidCallback onUnlock;
+  const _AccessBanner({required this.error, required this.onUnlock});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = Theme.of(context).colorScheme;
+    final canUnlock = error.code == 'MAILBOX_PASSWORD_REQUIRED';
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: s.errorContainer,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(error.message, style: TextStyle(color: s.onErrorContainer)),
+          if (canUnlock) ...[
+            const SizedBox(height: 8),
+            FilledButton.icon(
+              onPressed: onUnlock,
+              icon: const Icon(Icons.key, size: 18),
+              label: const Text('Masukkan password'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _DomainPicker extends StatefulWidget {
+  const _DomainPicker();
+  @override
+  State<_DomainPicker> createState() => _DomainPickerState();
+}
+
+class _DomainPickerState extends State<_DomainPicker> {
+  final _q = TextEditingController();
+  List _items = const [];
+  bool _loading = true;
+  String? _error;
+  Timer? _debounce;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _q.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final q = _q.text.trim();
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final r = await api.domains(q: q, perPage: 100);
+      if (mounted && q == _q.text.trim()) {
+        setState(() => _items = listOf(r, ['items', 'domains']));
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = errorText(e));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: MediaQuery.of(context).size.height * 0.75,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: TextField(
+              controller: _q,
+              autofocus: true,
+              autocorrect: false,
+              decoration: const InputDecoration(
+                hintText: 'Cari domain',
+                prefixIcon: Icon(Icons.search),
+                isDense: true,
+              ),
+              onChanged: (_) {
+                _debounce?.cancel();
+                _debounce = Timer(const Duration(milliseconds: 350), _load);
+              },
+            ),
+          ),
+          if (_loading) const LinearProgressIndicator(minHeight: 2),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(_error!, style: TextStyle(color: s.error)),
+            ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: _items.length,
+              itemBuilder: (ctx, i) {
+                final m = _items[i];
+                final d = m is Map ? '${m['domain'] ?? m['name']}' : '$m';
+                final g = m is Map ? m['group']?.toString() : null;
+                return ListTile(
+                  dense: true,
+                  title: Text(d),
+                  subtitle: g == null ? null : Text(g),
+                  onTap: () => Navigator.pop(context, d),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class InboxScreen extends StatefulWidget {
   const InboxScreen({super.key});
   @override

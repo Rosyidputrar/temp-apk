@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'account.dart';
 import 'api.dart';
 import 'screens_main.dart';
 import 'screens_otp.dart';
@@ -64,6 +65,10 @@ class AppState extends ChangeNotifier {
     notifyListeners();
     await _save();
   }
+
+  /// Alamat aktif sama, tapi aksesnya baru berubah (mis. baru dibuka dengan
+  /// password) → layar yang mendengarkan memuat ulang.
+  void touch() => notifyListeners();
 
   Future<void> clearActive() async {
     activeRef = null;
@@ -158,6 +163,11 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // JANGAN await apa pun sebelum runApp: frame pertama harus digambar dulu.
   // (Await SharedPreferences di sini pernah bikin layar hitam permanen.)
+  if (kPublic) {
+    // Sesi tersimpan; juga memasang penangan "sesi dicabut server".
+    // ignore: unawaited_futures
+    authState.load().catchError((_) {});
+  }
   // ignore: unawaited_futures
   appState
       .load()
@@ -274,7 +284,7 @@ class TempMailApp extends StatelessWidget {
       theme: theme(scheme),
       darkTheme: theme(darkScheme),
       themeMode: ThemeMode.system,
-      home: const Shell(),
+      home: const AuthGate(child: Shell()),
     );
   }
 }
@@ -299,6 +309,8 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
     super.initState();
     currentTab.addListener(_onTab);
     WidgetsBinding.instance.addObserver(this);
+    // APK publik: kuota & masa aktif terbaru (sekaligus memeriksa sesi).
+    if (kPublic) authState.refresh().catchError((_) => null);
   }
 
   @override
@@ -376,12 +388,29 @@ String errorText(Object e) {
 
 void showError(BuildContext context, Object e) {
   final s = Theme.of(context).colorScheme;
+  // Alamat milik akun lain → langsung tawarkan membuka dengan password.
+  final needsPassword =
+      e is ApiException &&
+      (e.code == 'MAILBOX_PASSWORD_REQUIRED' ||
+          (e.code == 'ADDRESS_TAKEN' &&
+              e.details is Map &&
+              (e.details as Map)['needs_password'] == true));
   ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
     ..showSnackBar(
       SnackBar(
         content: Text(errorText(e), style: TextStyle(color: s.onError)),
         backgroundColor: s.error,
+        action: needsPassword
+            ? SnackBarAction(
+                label: 'Buka',
+                textColor: s.onError,
+                onPressed: () {
+                  final ctx = navigatorKey.currentContext;
+                  if (ctx != null) resolveAccessError(ctx, e);
+                },
+              )
+            : null,
       ),
     );
 }

@@ -38,10 +38,12 @@ jobs:
       - name: Ambil dependensi
         run: flutter pub get
 
-      - name: Cek kode (analyze + test)
+      - name: Cek kode (analyze + test, APK admin & publik)
         run: |
           flutter analyze --no-fatal-infos
           flutter test
+          flutter test --dart-define=PUBLIC_BUILD=true \
+            test/flavor_test.dart test/otp_detect_test.dart test/update_test.dart
 
       - name: Siapkan keystore dari Secrets
         env:
@@ -60,34 +62,96 @@ jobs:
           keyPassword=$KEYSTORE_PASSWORD
           EOF
 
-      - name: Build APK (token dari Secrets, bukan dari kode)
+      # APK admin: token admin dari Secrets (JANGAN dirilis di repo publik).
+      - name: Build APK admin
         env:
           API_TOKEN: ${{ secrets.API_TOKEN }}
+          UPDATE_REPO: ${{ vars.ADMIN_UPDATE_REPO || github.repository }}
         run: |
           if [ -z "$API_TOKEN" ]; then
-            echo "::warning::Secret API_TOKEN kosong — aplikasi tidak bisa memanggil server."
+            echo "::warning::Secret API_TOKEN kosong — APK admin tidak bisa memanggil server."
           fi
-          flutter build apk --release --split-per-abi \
-            --dart-define=API_BASE=https://rest-tempmail.rosdiyttaa.workers.dev \
+          flutter build apk --release --split-per-abi --flavor admin \
+            --dart-define=API_BASE=${{ vars.API_BASE || 'https://rest-tempmail.rosdiyttaa.workers.dev' }} \
             --dart-define=API_TOKEN="$API_TOKEN" \
             --dart-define=APP_BUILD=${{ github.run_number }} \
-            --dart-define=UPDATE_REPO=${{ github.repository }} \
+            --dart-define=UPDATE_REPO="$UPDATE_REPO" \
             --build-number=${{ github.run_number }}
 
-      - name: Unggah APK sebagai artifact
+      # APK publik: TANPA token admin; pengguna login dengan akun dari admin.
+      - name: Build APK publik
+        env:
+          UPDATE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || github.repository }}
+        run: |
+          flutter build apk --release --split-per-abi --flavor public \
+            --dart-define=PUBLIC_BUILD=true \
+            --dart-define=API_BASE=${{ vars.API_BASE || 'https://rest-tempmail.rosdiyttaa.workers.dev' }} \
+            --dart-define=APP_BUILD=${{ github.run_number }} \
+            --dart-define=UPDATE_REPO="$UPDATE_REPO" \
+            --build-number=${{ github.run_number }}
+
+      # Nama file rilis tetap "app-<abi>-release.apk" per edisi (dipakai pembaruan di aplikasi).
+      - name: Kumpulkan APK per edisi
+        run: |
+          set -e
+          out=build/app/outputs/flutter-apk
+          mkdir -p dist/admin dist/public
+          for f in "$out"/app-*-admin-release.apk; do
+            cp "$f" "dist/admin/$(basename "$f" | sed 's/-admin-release/-release/')"
+          done
+          for f in "$out"/app-*-public-release.apk; do
+            cp "$f" "dist/public/$(basename "$f" | sed 's/-public-release/-release/')"
+          done
+          # Pastikan APK publik benar-benar tanpa token admin.
+          if [ -n "$API_TOKEN" ]; then
+            for f in dist/public/*.apk; do
+              if unzip -p "$f" 'lib/*/libapp.so' | grep -aqF "$API_TOKEN"; then
+                echo "::error::Token admin ditemukan di $f"; exit 1
+              fi
+            done
+          fi
+          ls -l dist/admin dist/public
+        env:
+          API_TOKEN: ${{ secrets.API_TOKEN }}
+
+      - name: Unggah APK admin (artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: tempmail-apk-${{ github.run_number }}
-          path: build/app/outputs/flutter-apk/*-release.apk
+          name: tempmail-admin-${{ github.run_number }}
+          path: dist/admin/*.apk
           if-no-files-found: error
 
-      # Release hanya untuk push ke main (bukan PR / jalankan manual di branch lain).
-      - name: Terbitkan release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Unggah APK publik (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: tempmail-public-${{ github.run_number }}
+          path: dist/public/*.apk
+          if-no-files-found: error
+
+      # Release APK admin hanya bila repo ini PRIVAT: APK admin berisi token admin.
+      - name: Terbitkan release admin
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.event.repository.private
         uses: softprops/action-gh-release@v2
         with:
           tag_name: b${{ github.run_number }}
-          name: Build ${{ github.run_number }}
+          name: Build ${{ github.run_number }} (admin)
           make_latest: true
           # Semua APK per ABI: pembaruan di aplikasi memilih yang cocok dengan HP.
-          files: build/app/outputs/flutter-apk/app-*-release.apk
+          files: dist/admin/app-*-release.apk
+
+      - name: Lewati release admin (repo publik)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.private
+        run: echo "::warning::Repo ini publik — APK admin TIDAK dirilis (berisi token admin). Ambil dari artifact tempmail-admin-${{ github.run_number }}."
+
+      # Release APK publik ke repo rilis publik (vars.PUBLIC_RELEASE_REPO), token
+      # secrets.PUBLIC_RELEASE_TOKEN = fine-grained PAT dengan izin Contents: write di repo itu.
+      - name: Terbitkan release publik
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PUBLIC_RELEASE_REPO != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ vars.PUBLIC_RELEASE_REPO }}
+          token: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          tag_name: b${{ github.run_number }}
+          name: TempMail build ${{ github.run_number }}
+          make_latest: true
+          files: dist/public/app-*-release.apk
