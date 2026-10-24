@@ -7,6 +7,10 @@ import 'package:flutter/services.dart';
 
 import 'api.dart';
 import 'main.dart';
+import 'home_widgets.dart';
+import 'notify.dart';
+import 'otp_detect.dart';
+import 'screens_main.dart' show fmtTime;
 
 class OtpScreen extends StatefulWidget {
   const OtpScreen({super.key});
@@ -25,10 +29,13 @@ class _OtpScreenState extends State<OtpScreen> {
   int _waitGen = 0; // naik saat "Batal" → hasil tunggu lama diabaikan
   int _waitSecs = 0;
   Timer? _waitTick;
+  Timer? _waitPoll; // cek inbox selama menunggu (cadangan deteksi server)
+  bool _polling = false;
   final _timeoutCtl = TextEditingController(text: '50');
   final _refsCtl = TextEditingController();
   dynamic _waitAnyResult;
   bool _waitingAny = false;
+  int _anyGen = 0; // naik saat dihentikan dari notifikasi
   String _waitAnyMode = 'otp';
 
   StreamSubscription? _sub;
@@ -41,6 +48,10 @@ class _OtpScreenState extends State<OtpScreen> {
   dynamic _verifyLatest;
   dynamic _verifyWait;
   bool _verifyWaiting = false;
+  bool _verifyLoading = false;
+  int _verifyGen = 0; // naik saat "Tunggu link" dibatalkan
+  String? _waitError; // galat/timeout "Tunggu OTP" (pesan ramah, bukan JSON)
+  String? _waitAnyError;
 
   String? _shownRef;
 
@@ -50,15 +61,65 @@ class _OtpScreenState extends State<OtpScreen> {
     _shownRef = appState.activeRef;
     appState.addListener(_onState);
     currentTab.addListener(_onTab);
+    Notifier.instance.addListener(_onNotif);
+    otpCommand.addListener(_onCommand);
+  }
+
+  /// Perintah dari widget layar utama ("Tunggu OTP"). Bila alamat aktif
+  /// belum termuat (aplikasi baru dibuka), dijalankan saat alamat siap.
+  void _onCommand() {
+    if (!mounted || otpCommand.value != 'wait' || _ref == null) return;
+    otpCommand.value = null;
+    if (!_waiting) _wait();
+  }
+
+  /// Tombol "Berhenti" di notifikasi status menunggu.
+  void _onNotif(String action, String payload) {
+    if (action != 'wait_stop' || !mounted) return;
+    if (_waiting) _wait();
+    if (_streaming) _toggleStream();
+    if (_waitingAny) _cancelWaitAny();
+    if (_verifyWaiting) _cancelVerifyWait();
+  }
+
+  void _cancelWaitAny() {
+    _anyGen++;
+    Notifier.instance.setWaiting('any', null);
+    setState(() => _waitingAny = false);
+  }
+
+  void _cancelVerifyWait() {
+    _verifyGen++;
+    Notifier.instance.setWaiting('link', null);
+    setState(() => _verifyWaiting = false);
+  }
+
+  String get _addr => appState.activeAddress ?? _ref ?? '';
+
+  /// Notifikasi OTP hanya bila pengguna tidak sedang melihat tab OTP.
+  void _notifyOtp(String code, dynamic msg, {String? address}) {
+    final m = msg is Map ? msg : const {};
+    // Widget layar utama ikut menampilkan OTP alamat aktif.
+    if (address == null || address == _addr) {
+      HomeWidgets.publishOtp(
+        code,
+        subject: m['subject']?.toString(),
+        from: m['from']?.toString(),
+      );
+    }
+    if (Notifier.instance.inForeground && currentTab.value == kTabOtp) return;
+    Notifier.instance.otpArrived(
+      code,
+      subject: m['subject']?.toString(),
+      from: m['from']?.toString(),
+      address: address ?? _addr,
+    );
   }
 
   // Buka tab OTP → langsung tampilkan OTP terbaru (sekali per alamat).
+  // Buka tab OTP → segarkan OTP terbaru (email baru bisa masuk kapan saja).
   void _onTab() {
-    if (currentTab.value == kTabOtp &&
-        _ref != null &&
-        _latest == null &&
-        _latestEmpty == null &&
-        !_loadingLatest) {
+    if (currentTab.value == kTabOtp && _ref != null && !_loadingLatest) {
       _loadLatest();
     }
   }
@@ -67,8 +128,13 @@ class _OtpScreenState extends State<OtpScreen> {
   void dispose() {
     appState.removeListener(_onState);
     currentTab.removeListener(_onTab);
+    Notifier.instance.removeListener(_onNotif);
+    otpCommand.removeListener(_onCommand);
+    Notifier.instance.clearWaiting();
     _sub?.cancel();
-    _waitTick?.cancel();
+    // Hentikan juga polling inbox saat menunggu (mis. layar ditutup karena logout).
+    _waitGen++;
+    _stopWaitTick();
     _timeoutCtl.dispose();
     _refsCtl.dispose();
     _extractCtl.dispose();
@@ -84,7 +150,13 @@ class _OtpScreenState extends State<OtpScreen> {
       _stopWaitTick();
       _waitGen++;
       _refGen++;
+      _verifyGen++;
+      Notifier.instance.setWaiting('wait', null);
+      Notifier.instance.setWaiting('stream', null);
+      Notifier.instance.setWaiting('link', null);
       setState(() {
+        _waitError = null;
+        _verifyLoading = false;
         _shownRef = appState.activeRef;
         _loadingLatest = false;
         _latest = null;
@@ -101,6 +173,7 @@ class _OtpScreenState extends State<OtpScreen> {
     } else {
       setState(() {});
     }
+    _onCommand();
   }
 
   String? get _ref => appState.activeRef;
@@ -111,12 +184,77 @@ class _OtpScreenState extends State<OtpScreen> {
   void _stopWaitTick() {
     _waitTick?.cancel();
     _waitTick = null;
+    _waitPoll?.cancel();
+    _waitPoll = null;
+  }
+
+  /// Cadangan bila server tidak mengenali kode (mis. "08737 adalah kode
+  /// konfirmasi Facebook"): cari OTP di email terbaru inbox.
+  /// [maxAgeSec] = hanya email yang masuk dalam N detik terakhir.
+  Future<Map<String, dynamic>?> _detectFromInbox(
+    String ref, {
+    int? maxAgeSec,
+  }) async {
+    final r = await api.messages(ref, limit: 10, fresh: true);
+    final list = listOf(r, ['messages', 'items']).whereType<Map>().toList();
+    int ageOf(Map m) {
+      final a = m['age_seconds'];
+      return a is num ? a.round() : 1 << 30;
+    }
+
+    list.sort((a, b) => ageOf(a).compareTo(ageOf(b)));
+    for (final m in list) {
+      if (maxAgeSec != null && ageOf(m) > maxAgeSec) continue;
+      final hit = messageOtp(m);
+      if (hit == null) continue;
+      return {
+        'otp': hit.$1,
+        'detected': !hit.$2,
+        'message': {
+          'subject': m['subject'],
+          'from': m['from'],
+          'age_seconds': m['age_seconds'],
+        },
+      };
+    }
+    return null;
   }
 
   Future<void> _autoCopy(String code) async {
     await Clipboard.setData(ClipboardData(text: code));
     HapticFeedback.mediumImpact();
     if (mounted) showOk(context, 'OTP $code disalin otomatis');
+  }
+
+  /// Link verifikasi/login masuk: salin otomatis, kirim ke widget, dan
+  /// (bila [notify] & tab OTP tidak sedang dilihat) tampilkan notifikasi.
+  Future<void> _gotLink(
+    String url,
+    dynamic msg, {
+    String? address,
+    bool notify = true,
+  }) async {
+    final m = msg is Map ? msg : const {};
+    await Clipboard.setData(ClipboardData(text: url));
+    HapticFeedback.mediumImpact();
+    if (mounted) showOk(context, 'Link disalin otomatis');
+    if (address == null || address == _addr) {
+      HomeWidgets.publishLink(
+        url,
+        subject: m['subject']?.toString(),
+        from: m['from']?.toString(),
+      );
+    }
+    if (!notify ||
+        (Notifier.instance.inForeground && currentTab.value == kTabOtp)) {
+      return;
+    }
+    Notifier.instance.linkArrived(
+      url,
+      subject: m['subject']?.toString(),
+      from: m['from']?.toString(),
+      address: address ?? _addr,
+    );
   }
 
   Future<void> _loadLatest() async {
@@ -131,14 +269,39 @@ class _OtpScreenState extends State<OtpScreen> {
           _latest = r;
           _latestEmpty = null;
         });
+        final code = r is Map ? r['otp']?.toString() : null;
+        final msg = r is Map && r['message'] is Map
+            ? r['message'] as Map
+            : null;
+        if (code != null && code.isNotEmpty) {
+          HomeWidgets.publishOtp(
+            code,
+            subject: msg?['subject']?.toString(),
+            from: msg?['from']?.toString(),
+          );
+        }
       }
     } on ApiException catch (e) {
       if (!mounted || gen != _refGen) return;
       if (e.code == 'NO_OTP' || e.status == 404) {
+        // Server tidak menemukan OTP → coba deteksi sendiri dari inbox.
+        Map<String, dynamic>? fb;
+        try {
+          fb = await _detectFromInbox(ref);
+        } catch (_) {}
+        if (!mounted || gen != _refGen) return;
         setState(() {
-          _latest = null;
-          _latestEmpty = 'Belum ada email berisi OTP. Kirim ke alamat ini lalu tekan "Tunggu OTP".';
+          _latest = fb;
+          _latestEmpty = fb != null ? null : 'Belum ada email berisi OTP. Kirim ke alamat ini lalu tekan "Tunggu OTP".';
         });
+        if (fb != null) {
+          final msg = fb['message'] as Map;
+          HomeWidgets.publishOtp(
+            '${fb['otp']}',
+            subject: msg['subject']?.toString(),
+            from: msg['from']?.toString(),
+          );
+        }
       } else {
         showError(context, e);
       }
@@ -185,6 +348,7 @@ class _OtpScreenState extends State<OtpScreen> {
       // Batal: request HTTP tetap jalan di belakang, hasilnya diabaikan.
       _waitGen++;
       _stopWaitTick();
+      Notifier.instance.setWaiting('wait', null);
       setState(() => _waiting = false);
       showOk(context, 'Menunggu dibatalkan');
       return;
@@ -192,42 +356,85 @@ class _OtpScreenState extends State<OtpScreen> {
     final ref = _ref;
     if (ref == null) return;
     final gen = ++_waitGen;
+    final addr = _addr;
+    // Status di notifikasi + foreground service: tetap menunggu walau
+    // aplikasi ditinggal ke situs pendaftaran.
+    Notifier.instance.ensurePermission();
+    Notifier.instance.setWaiting('wait', '$addr · maks $_timeout dtk');
     setState(() {
       _waiting = true;
       _waitResult = null;
+      _waitError = null;
       _waitStale = false;
       _waitSecs = 0;
     });
     _waitTick = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _waitSecs++);
     });
+    // Sambil menunggu server, periksa inbox: email BARU yang kodenya tidak
+    // dikenali server tetap tertangkap (deteksi aplikasi).
+    final started = DateTime.now();
+    _waitPoll = Timer.periodic(const Duration(seconds: 6), (_) async {
+      if (_polling || gen != _waitGen) return;
+      _polling = true;
+      try {
+        final elapsed = DateTime.now().difference(started).inSeconds;
+        final fb = await _detectFromInbox(ref, maxAgeSec: elapsed + 5);
+        if (fb == null || gen != _waitGen || !mounted) return;
+        _waitGen++; // hasil long-poll server diabaikan
+        _stopWaitTick();
+        Notifier.instance.setWaiting('wait', null);
+        setState(() {
+          _waiting = false;
+          _waitResult = fb;
+          _waitError = null;
+          _waitStale = false;
+        });
+        final code = '${fb['otp']}';
+        _autoCopy(code);
+        _notifyOtp(code, fb['message'], address: addr);
+      } catch (_) {
+        // Gagal cek inbox tidak mengganggu penantian utama.
+      } finally {
+        _polling = false;
+      }
+    });
     try {
       final r = await api.otpWait(ref, timeout: _timeout);
       if (!mounted || gen != _waitGen) return;
       setState(() => _waitResult = r);
       final code = r is Map ? r['otp']?.toString() : null;
-      if (code != null && code.isNotEmpty) _autoCopy(code);
+      if (code != null && code.isNotEmpty) {
+        _autoCopy(code);
+        _notifyOtp(code, r is Map ? r['message'] : null, address: addr);
+      }
     } catch (e) {
       if (!mounted || gen != _waitGen) return;
       final stale = e is ApiException && e.details is Map
           ? (e.details as Map)['stale_otp']
           : null;
+      if (!Notifier.instance.inForeground) {
+        Notifier.instance.otpInfo(
+          'Waktu tunggu OTP habis',
+          stale is Map
+              ? 'Tidak ada OTP baru untuk $addr. OTP lama: ${stale['otp']}'
+              : 'Belum ada OTP baru untuk $addr. Buka aplikasi untuk menunggu lagi.',
+        );
+      }
       setState(() {
         if (stale is Map) {
           _waitResult = {'otp': stale['otp'], 'message': stale};
           _waitStale = true;
         } else {
-          _waitResult = {
-            'status': e is ApiException && e.code == 'WAIT_TIMEOUT'
-                ? 'Waktu habis, tidak ada OTP baru'
-                : 'Gagal',
-            'pesan': errorText(e),
-          };
+          _waitError = e is ApiException && e.code == 'WAIT_TIMEOUT'
+              ? 'Waktu habis, tidak ada OTP baru dalam $_timeout dtk.'
+              : errorText(e);
         }
       });
     } finally {
       if (gen == _waitGen) {
         _stopWaitTick();
+        Notifier.instance.setWaiting('wait', null);
         if (mounted) setState(() => _waiting = false);
       }
     }
@@ -248,28 +455,53 @@ class _OtpScreenState extends State<OtpScreen> {
       showError(context, 'Maksimal 10 alamat (sekarang ${refs.length})');
       return;
     }
+    if (_waitingAny) {
+      _cancelWaitAny();
+      showOk(context, 'Menunggu dibatalkan');
+      return;
+    }
+    final gen = ++_anyGen;
     setState(() {
       _waitingAny = true;
       _waitAnyResult = null;
+      _waitAnyError = null;
     });
+    Notifier.instance.ensurePermission();
+    Notifier.instance.setWaiting(
+      'any',
+      '${refs.length} alamat (${_waitAnyMode == 'link' ? 'link' : 'OTP'})',
+    );
     try {
       final r = await api.otpWaitAny(
         refs: refs,
         timeout: _timeout,
         mode: _waitAnyMode,
       );
+      if (gen != _anyGen) return;
       if (mounted) setState(() => _waitAnyResult = r);
+      final addr = r is Map ? (r['address'] ?? r['ref'])?.toString() : null;
+      final code = r is Map ? r['otp']?.toString() : null;
+      final link = _waitAnyMode == 'link' ? _value(r, 'link') : null;
+      if (link != null && link.isNotEmpty) {
+        _gotLink(link, r is Map ? r['message'] : null, address: addr);
+      } else if (code != null && code.isNotEmpty) {
+        _autoCopy(code);
+        _notifyOtp(code, r['message'], address: addr);
+      }
     } catch (e) {
+      if (gen != _anyGen) return;
       if (mounted) {
         setState(
-          () => _waitAnyResult = {
-            'status': 'timeout/gagal',
-            'pesan': errorText(e),
-          },
+          () => _waitAnyError = e is ApiException && e.code == 'WAIT_TIMEOUT'
+              ? 'Waktu habis, belum ada yang datang dalam $_timeout dtk.'
+              : errorText(e),
         );
       }
     } finally {
-      if (mounted) setState(() => _waitingAny = false);
+      if (gen == _anyGen) {
+        Notifier.instance.setWaiting('any', null);
+        if (mounted) setState(() => _waitingAny = false);
+      }
     }
   }
 
@@ -277,15 +509,19 @@ class _OtpScreenState extends State<OtpScreen> {
     if (_streaming) {
       _sub?.cancel();
       _sub = null;
+      Notifier.instance.setWaiting('stream', null);
       setState(() => _streaming = false);
       return;
     }
     final ref = _ref;
     if (ref == null) return;
+    final addr = _addr;
     setState(() {
       _streaming = true;
       _streamLog.clear();
     });
+    Notifier.instance.ensurePermission();
+    Notifier.instance.setWaiting('stream', 'Stream real-time · $addr');
     _sub = api
         .otpStream(ref)
         .listen(
@@ -306,14 +542,17 @@ class _OtpScreenState extends State<OtpScreen> {
             });
             if (ev['event'] == 'otp' && code != null) {
               _autoCopy(code.toString());
+              _notifyOtp(code.toString(), ev, address: addr);
             }
             if (ev['event'] == 'timeout') {
               _sub?.cancel();
               _sub = null;
+              Notifier.instance.setWaiting('stream', null);
               setState(() => _streaming = false);
             }
           },
           onError: (e) {
+            Notifier.instance.setWaiting('stream', null);
             if (mounted) {
               setState(() {
                 _streamLog.insert(0, 'error: ${errorText(e)}');
@@ -322,6 +561,7 @@ class _OtpScreenState extends State<OtpScreen> {
             }
           },
           onDone: () {
+            Notifier.instance.setWaiting('stream', null);
             if (mounted) setState(() => _streaming = false);
           },
         );
@@ -339,14 +579,27 @@ class _OtpScreenState extends State<OtpScreen> {
   }
 
   Future<void> _verify(bool wait) async {
+    if (wait && _verifyWaiting) {
+      _cancelVerifyWait();
+      showOk(context, 'Menunggu link dibatalkan');
+      return;
+    }
     final ref = _ref;
     if (ref == null) return;
     final gen = _refGen;
-    if (wait) setState(() => _verifyWaiting = true);
+    final vgen = wait ? ++_verifyGen : _verifyGen;
+    if (wait) {
+      setState(() => _verifyWaiting = true);
+      Notifier.instance.ensurePermission();
+      Notifier.instance.setWaiting('link', 'Link verifikasi · $_addr');
+    } else {
+      setState(() => _verifyLoading = true);
+    }
     try {
       final r = wait
           ? await api.verifyWait(ref, timeout: _timeout)
           : await api.verifyLatest(ref);
+      if (wait && vgen != _verifyGen) return;
       if (mounted && gen == _refGen) {
         setState(() {
           if (wait) {
@@ -355,14 +608,98 @@ class _OtpScreenState extends State<OtpScreen> {
             _verifyLatest = r;
           }
         });
+        final link = _value(r, 'link');
+        if (link != null && link.isNotEmpty) {
+          // "Tunggu link" → notifikasi bila ditinggal; "Link terbaru" dipicu
+          // dari aplikasi → cukup disalin.
+          _gotLink(link, r is Map ? r['message'] : null, notify: wait);
+        }
       }
     } catch (e) {
+      if (wait && vgen != _verifyGen) return;
       if (mounted && gen == _refGen) showError(context, e);
     } finally {
-      if (mounted && wait && gen == _refGen) {
-        setState(() => _verifyWaiting = false);
+      if (wait && vgen == _verifyGen) {
+        Notifier.instance.setWaiting('link', null);
+        if (mounted) setState(() => _verifyWaiting = false);
+      } else if (!wait && mounted && gen == _refGen) {
+        setState(() => _verifyLoading = false);
       }
     }
+  }
+
+  /// Kartu pesan biasa (waktu habis / gagal) — pengganti JSON mentah.
+  Widget _infoCard(String text, {bool error = false}) {
+    final s = Theme.of(context).colorScheme;
+    return Card(
+      color: error ? s.errorContainer : null,
+      child: ListTile(
+        leading: Icon(
+          error ? Icons.error_outline : Icons.timer_off_outlined,
+          color: error ? s.onErrorContainer : s.onSurfaceVariant,
+        ),
+        title: Text(
+          text,
+          style: TextStyle(color: error ? s.onErrorContainer : null),
+        ),
+      ),
+    );
+  }
+
+  /// Riwayat OTP sebagai daftar (kode · subjek · waktu), JSON hanya cadangan.
+  Widget _historyView(dynamic h) {
+    final s = Theme.of(context).colorScheme;
+    final items = listOf(h, ['items', 'history', 'otps', 'entries']);
+    if (items.isEmpty) {
+      final empty = h == null || (h is Map && h.isEmpty) || (h is List);
+      return empty
+          ? Text(
+              'Belum ada riwayat OTP.',
+              style: TextStyle(color: s.onSurfaceVariant),
+            )
+          : JsonView(h);
+    }
+    return Column(
+      children: [
+        for (final it in items.take(30))
+          if (it is Map)
+            ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.pin_outlined, size: 20),
+              title: Text(
+                '${it['otp'] ?? it['code'] ?? '-'}',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1,
+                ),
+              ),
+              subtitle: Text(
+                [
+                  it['subject'],
+                  it['from'],
+                  if ((it['at'] ??
+                          it['time'] ??
+                          it['received_at'] ??
+                          it['ts']) !=
+                      null)
+                    fmtTime(
+                      it['at'] ?? it['time'] ?? it['received_at'] ?? it['ts'],
+                    ),
+                ].where((e) => e != null && '$e'.isNotEmpty).join(' · '),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: const Icon(Icons.copy, size: 18),
+              onTap: () {
+                final c = '${it['otp'] ?? it['code'] ?? ''}';
+                if (c.isNotEmpty) copyText(context, c, 'OTP $c disalin');
+              },
+            )
+          else
+            ListTile(dense: true, title: Text('$it')),
+      ],
+    );
   }
 
   /// Ambil nilai utama (kode OTP / URL link) dari respons.
@@ -426,6 +763,17 @@ class _OtpScreenState extends State<OtpScreen> {
                             ),
                     ),
                   ),
+                  if (isLink)
+                    IconButton(
+                      tooltip: 'Buka di browser',
+                      icon: const Icon(Icons.open_in_new),
+                      onPressed: () async {
+                        final ok = await openExternalUrl(code);
+                        if (!ok && mounted) {
+                          showError(context, 'Link tidak bisa dibuka: $code');
+                        }
+                      },
+                    ),
                   IconButton.filledTonal(
                     tooltip: 'Salin',
                     icon: const Icon(Icons.copy),
@@ -443,6 +791,15 @@ class _OtpScreenState extends State<OtpScreen> {
                       .where((e) => e != null && e.toString().isNotEmpty)
                       .join(' • '),
                   style: TextStyle(color: s.onSurfaceVariant),
+                ),
+              ),
+            if (r is Map && r['detected'] == true)
+              Padding(
+                padding: const EdgeInsets.only(top: 4),
+                child: Text(
+                  'Dideteksi aplikasi dari subjek/isi email (server tidak '
+                  'mengenalinya).',
+                  style: TextStyle(color: s.onSurfaceVariant, fontSize: 12),
                 ),
               ),
           ],
@@ -566,6 +923,7 @@ class _OtpScreenState extends State<OtpScreen> {
                         inputFormatters: [
                           FilteringTextInputFormatter.digitsOnly,
                         ],
+                        onChanged: (_) => setState(() {}),
                         decoration: const InputDecoration(
                           suffixText: 'dtk',
                           isDense: true,
@@ -574,6 +932,15 @@ class _OtpScreenState extends State<OtpScreen> {
                     ),
                   ],
                 ),
+                if (int.tryParse(_timeoutCtl.text.trim()) case final t?
+                    when t != _timeout)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      'Batas 5–280 dtk — dipakai $_timeout dtk.',
+                      style: TextStyle(color: s.error, fontSize: 12),
+                    ),
+                  ),
                 if (_waiting) ...[
                   const SizedBox(height: 8),
                   LinearProgressIndicator(
@@ -593,6 +960,13 @@ class _OtpScreenState extends State<OtpScreen> {
                 if (_waitResult != null) ...[
                   const SizedBox(height: 10),
                   _otpCard('Hasil tunggu OTP', _waitResult, stale: _waitStale),
+                ],
+                if (_waitError != null) ...[
+                  const SizedBox(height: 10),
+                  _infoCard(
+                    _waitError!,
+                    error: !_waitError!.startsWith('Waktu habis'),
+                  ),
                 ],
                 const SizedBox(height: 16),
                 _section('Stream real-time (SSE)', [
@@ -633,7 +1007,8 @@ class _OtpScreenState extends State<OtpScreen> {
                     minLines: 2,
                     autocorrect: false,
                     decoration: InputDecoration(
-                      labelText: 'Daftar ref (pisah baris/koma, maks 10)',
+                      labelText: 'Daftar ref',
+                      helperText: 'Pisahkan dengan baris/koma, maks 10',
                       suffixIcon: IconButton(
                         tooltip: 'Tambah alamat aktif',
                         icon: const Icon(Icons.add_circle_outline),
@@ -659,8 +1034,8 @@ class _OtpScreenState extends State<OtpScreen> {
                       const SizedBox(width: 10),
                       Expanded(
                         child: FilledButton.tonal(
-                          onPressed: _waitingAny ? null : _waitAny,
-                          child: Text(_waitingAny ? 'Menunggu…' : 'Tunggu'),
+                          onPressed: _waitAny,
+                          child: Text(_waitingAny ? 'Batal' : 'Tunggu'),
                         ),
                       ),
                     ],
@@ -676,6 +1051,17 @@ class _OtpScreenState extends State<OtpScreen> {
                     else
                       JsonView(_waitAnyResult),
                   ],
+                  if (_waitingAny) ...[
+                    const SizedBox(height: 8),
+                    const LinearProgressIndicator(minHeight: 2),
+                  ],
+                  if (_waitAnyError != null) ...[
+                    const SizedBox(height: 10),
+                    _infoCard(
+                      _waitAnyError!,
+                      error: !_waitAnyError!.startsWith('Waktu habis'),
+                    ),
+                  ],
                 ]),
                 const SizedBox(height: 16),
                 _section('Link verifikasi / reset', [
@@ -683,19 +1069,25 @@ class _OtpScreenState extends State<OtpScreen> {
                     children: [
                       Expanded(
                         child: OutlinedButton(
-                          onPressed: () => _verify(false),
-                          child: const Text('Link terbaru'),
+                          onPressed: _verifyLoading
+                              ? null
+                              : () => _verify(false),
+                          child: _verifyLoading
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Text('Link terbaru'),
                         ),
                       ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: OutlinedButton(
-                          onPressed: _verifyWaiting
-                              ? null
-                              : () => _verify(true),
-                          child: Text(
-                            _verifyWaiting ? 'Menunggu…' : 'Tunggu link',
-                          ),
+                          onPressed: () => _verify(true),
+                          child: Text(_verifyWaiting ? 'Batal' : 'Tunggu link'),
                         ),
                       ),
                     ],
@@ -712,7 +1104,7 @@ class _OtpScreenState extends State<OtpScreen> {
                 const SizedBox(height: 16),
                 _section(
                   'Riwayat OTP',
-                  [if (_history != null) JsonView(_history)],
+                  [if (_history != null) _historyView(_history)],
                   trailing: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: [

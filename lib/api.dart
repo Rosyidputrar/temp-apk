@@ -3,6 +3,10 @@
 // Base URL & token TIDAK ditulis di kode: disuntik saat build lewat
 //   flutter build apk --dart-define=API_BASE=https://... --dart-define=API_TOKEN=...
 // Di CI, nilai itu datang dari GitHub Secrets repo.
+//
+// Versi publik (--flavor public --dart-define=PUBLIC_BUILD=true) TIDAK membawa
+// token admin: pengguna login dengan akun buatan admin, dan token sesi
+// perangkat disimpan di [TempmailApi.sessionToken].
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -12,6 +16,17 @@ const String kApiBase = String.fromEnvironment(
   defaultValue: 'https://rest-tempmail.rosdiyttaa.workers.dev',
 );
 const String kApiToken = String.fromEnvironment('API_TOKEN');
+
+/// APK publik (login akun) vs APK admin (token admin bawaan).
+const bool kPublic = bool.fromEnvironment('PUBLIC_BUILD');
+
+/// Kode galat server yang berarti sesi akun tidak berlaku lagi.
+const kSessionLostCodes = {
+  'SESSION_REVOKED',
+  'SESSION_INVALID',
+  'ACCOUNT_EXPIRED',
+  'ACCOUNT_DISABLED',
+};
 
 class ApiException implements Exception {
   final int status;
@@ -33,6 +48,17 @@ class TempmailApi {
   final HttpClient _http = HttpClient()
     ..connectionTimeout = const Duration(seconds: 20);
 
+  /// Token sesi akun (APK publik). Diisi AuthState setelah login / saat start.
+  static String? sessionToken;
+
+  /// Dipanggil saat server menolak sesi (dikeluarkan, kedaluwarsa, dihapus).
+  static void Function(ApiException e)? onSessionLost;
+
+  String get _token => kPublic ? (sessionToken ?? '') : kApiToken;
+
+  /// Ada kredensial untuk memanggil server?
+  bool get hasCredentials => _token.isNotEmpty;
+
   Uri _u(String path, [Map<String, String?>? q]) {
     final clean = <String, String>{};
     q?.forEach((k, v) {
@@ -43,8 +69,8 @@ class TempmailApi {
   }
 
   Map<String, String> get _headers => {
-    'Authorization': 'Bearer $kApiToken',
-    'X-API-Key': kApiToken,
+    if (_token.isNotEmpty) 'Authorization': 'Bearer $_token',
+    if (_token.isNotEmpty) 'X-API-Key': _token,
     'Accept': 'application/json',
   };
 
@@ -109,31 +135,54 @@ class TempmailApi {
   });
 
   /// Bongkar amplop standar {ok, data, meta} / {ok:false, error}.
-  ApiResult _unwrap(int status, dynamic parsed, [String? fallbackMsg]) {
+  ApiResult _unwrap(
+    int status,
+    dynamic parsed, [
+    String? fallbackMsg,
+    String? usedToken,
+  ]) {
     if (parsed is Map && parsed['ok'] == true) {
       return ApiResult(
         parsed['data'],
         (parsed['meta'] as Map?)?.cast<String, dynamic>() ?? {},
       );
     }
-    throw _error(status, parsed, fallbackMsg);
+    throw _error(status, parsed, fallbackMsg, usedToken);
   }
 
-  ApiException _error(int status, dynamic parsed, [String? fallbackMsg]) {
+  /// [usedToken] = token yang dipakai permintaan itu. Sesi dianggap hilang hanya
+  /// untuk kode sesi eksplisit DAN bila tokennya masih token saat ini (respons
+  /// telat dari sesi lama tidak boleh mengeluarkan sesi baru).
+  ApiException _error(
+    int status,
+    dynamic parsed, [
+    String? fallbackMsg,
+    String? usedToken,
+  ]) {
     if (parsed is Map && parsed['error'] is Map) {
       final e = parsed['error'] as Map;
-      return ApiException(
+      final err = ApiException(
         status,
         e['code']?.toString() ?? 'ERROR',
         e['message']?.toString() ?? fallbackMsg ?? 'Permintaan gagal ($status)',
         e['details'],
       );
+      if (kPublic &&
+          kSessionLostCodes.contains(err.code) &&
+          usedToken != null &&
+          usedToken.isNotEmpty &&
+          usedToken == sessionToken) {
+        onSessionLost?.call(err);
+      }
+      return err;
     }
     if (status == 401 || status == 403) {
       return ApiException(
         status,
         'UNAUTHORIZED',
-        'Token API ditolak server. Pastikan API_TOKEN benar saat build.',
+        kPublic
+            ? 'Sesi ditolak server. Silakan login lagi.'
+            : 'Token API ditolak server. Pastikan API_TOKEN benar saat build.',
       );
     }
     return ApiException(
@@ -150,6 +199,7 @@ class TempmailApi {
     Object? body,
     Duration timeout = const Duration(seconds: 70),
   }) async {
+    final tok = _token;
     final (status, parsed) = await _send(
       method,
       path,
@@ -157,7 +207,7 @@ class TempmailApi {
       body: body,
       timeout: timeout,
     );
-    return _unwrap(status, parsed);
+    return _unwrap(status, parsed, null, tok);
   }
 
   Future<dynamic> get(
@@ -217,6 +267,48 @@ class TempmailApi {
 
   Future<dynamic> me() => get('/v1/me');
 
+  // ---------- akun (APK publik) ----------
+  Future<dynamic> login(String username, String password, {String? device}) =>
+      post(
+        '/v1/auth/login',
+        body: {'username': username, 'password': password, 'device': ?device},
+        timeout: const Duration(seconds: 30),
+      );
+
+  Future<dynamic> logout() => post('/v1/auth/logout');
+
+  Future<dynamic> authMe() => get('/v1/auth/me');
+
+  Future<dynamic> changePassword(String current, String next) =>
+      put('/v1/auth/password', body: {'current': current, 'new': next});
+
+  Future<dynamic> revokeSession(String id) =>
+      delete('/v1/auth/sessions/${enc(id)}');
+
+  Future<dynamic> revokeOtherSessions() => delete('/v1/auth/sessions');
+
+  /// Alamat milik akun + alamat akun lain yang sudah dibuka dengan password.
+  Future<dynamic> myMailboxes({String? q, int? limit, int? offset}) => get(
+    '/v1/mailboxes',
+    query: {'q': q, 'limit': limit?.toString(), 'offset': offset?.toString()},
+  );
+
+  Future<dynamic> dropAccess(String address) =>
+      delete('/v1/mailboxes/${enc(address)}/access');
+
+  /// Buka alamat milik akun lain dengan password email-nya.
+  Future<dynamic> unlockMailbox(String ref, String password) =>
+      post('/v1/mailbox/${enc(ref)}/unlock', body: {'password': password});
+
+  Future<dynamic> mailboxPassword(String ref) =>
+      get('/v1/mailbox/${enc(ref)}/password');
+
+  /// Ganti password email. [password] null/kosong = dibuatkan acak.
+  Future<dynamic> setMailboxPassword(String ref, {String? password}) => put(
+    '/v1/mailbox/${enc(ref)}/password',
+    body: {if (password != null && password.isNotEmpty) 'password': password},
+  );
+
   // ---------- mailbox ----------
   Future<dynamic> createMailbox({
     String? alias,
@@ -226,9 +318,11 @@ class TempmailApi {
     String? saveAs,
     List<String>? exclude,
     bool? randomAlias,
+    String? password,
   }) => post(
     '/v1/mailbox',
     body: {
+      if (password != null && password.isNotEmpty) 'password': password,
       if (alias != null && alias.isNotEmpty) 'alias': alias,
       if (domain != null && domain.isNotEmpty) 'domain': domain,
       if (group != null && group.isNotEmpty) 'group': group,
@@ -371,7 +465,8 @@ class TempmailApi {
 
   /// SSE: GET /v1/otp/{ref}/stream — event: ready/message/otp/ping/timeout
   Stream<Map<String, dynamic>> otpStream(String ref) async* {
-    final uri = _u('/v1/otp/${enc(ref)}/stream', {'token': kApiToken});
+    final tok = _token;
+    final uri = _u('/v1/otp/${enc(ref)}/stream', {'token': tok});
     final res = await _guard(() async {
       final req = await _http.getUrl(uri);
       _headers.forEach(req.headers.set);
@@ -386,7 +481,7 @@ class TempmailApi {
       } catch (_) {
         parsed = text;
       }
-      throw _error(res.statusCode, parsed, 'Stream ditolak server');
+      throw _error(res.statusCode, parsed, 'Stream ditolak server', tok);
     }
     var event = 'message';
     await for (final line
@@ -469,9 +564,10 @@ class TempmailApi {
   /// GET yang mengembalikan JSON apa adanya (untuk endpoint di luar
   /// amplop {ok,data} standar, mis. ekspor favorit {version,items}).
   Future<dynamic> rawGet(String path, {Map<String, String?>? query}) async {
+    final tok = _token;
     final (status, parsed) = await _send('GET', path, query: query);
     if ((parsed is Map && parsed['error'] is Map) || status >= 400) {
-      throw _error(status, parsed, 'Permintaan gagal');
+      throw _error(status, parsed, 'Permintaan gagal', tok);
     }
     return parsed;
   }
@@ -688,6 +784,61 @@ class TempmailApi {
       put('/v1/admin/otp-patterns', body: {'patterns': patterns});
 
   Future<dynamic> adminDeleteOtpPatterns() => delete('/v1/admin/otp-patterns');
+
+  // ---------- admin: akun APK publik ----------
+  Future<dynamic> adminUsers({String? q}) =>
+      get('/v1/admin/users', query: {'q': q, 'limit': '500'});
+
+  /// [password] kosong = dibuatkan acak (dikembalikan sekali di respons).
+  Future<dynamic> adminCreateUser({
+    required String username,
+    String? password,
+    int? dailyQuota,
+    int? maxDevices,
+    String? expiresAt,
+    String? note,
+  }) => post(
+    '/v1/admin/users',
+    body: {
+      'username': username,
+      if (password != null && password.isNotEmpty) 'password': password,
+      'daily_quota': ?dailyQuota,
+      'max_devices': ?maxDevices,
+      if (expiresAt != null && expiresAt.isNotEmpty) 'expires_at': expiresAt,
+      if (note != null && note.isNotEmpty) 'note': note,
+    },
+  );
+
+  Future<dynamic> adminUser(String username) =>
+      get('/v1/admin/users/${enc(username)}');
+
+  /// Kirim hanya field yang diubah. 'password': '' = reset acak,
+  /// 'expires_at': null = permanen.
+  Future<dynamic> adminPatchUser(String username, Map<String, dynamic> body) =>
+      patch('/v1/admin/users/${enc(username)}', body: body);
+
+  Future<dynamic> adminDeleteUser(String username) =>
+      delete('/v1/admin/users/${enc(username)}', query: {'confirm': '1'});
+
+  Future<dynamic> adminRevokeUserSessions(String username) =>
+      delete('/v1/admin/users/${enc(username)}/sessions');
+
+  Future<dynamic> adminMailboxes({String? q, String? owner, int? limit}) => get(
+    '/v1/admin/mailboxes',
+    query: {'q': q, 'owner': owner, 'limit': (limit ?? 100).toString()},
+  );
+
+  Future<dynamic> adminPatchMailbox(
+    String address, {
+    String? owner,
+    bool? locked,
+  }) => patch(
+    '/v1/admin/mailboxes/${enc(address)}',
+    body: {'owner': ?owner, 'locked': ?locked},
+  );
+
+  Future<dynamic> adminClaimExisting() =>
+      post('/v1/admin/mailboxes/claim-existing', body: {});
 
   void close() => _http.close(force: true);
 }

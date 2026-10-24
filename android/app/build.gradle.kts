@@ -30,6 +30,8 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
+        // Wajib untuk flutter_local_notifications (java.time di Android lama).
+        isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -49,6 +51,23 @@ android {
         versionName = flutter.versionName
     }
 
+    // Dua APK yang bisa terpasang berdampingan:
+    //  admin  : com.rosdie.tempmail        "TempMail Admin" (token admin bawaan)
+    //  public : com.rosdie.tempmail.public "TempMail"       (login akun dari admin)
+    // Build: flutter build apk --flavor admin|public (public + --dart-define=PUBLIC_BUILD=true)
+    flavorDimensions += "edition"
+    productFlavors {
+        create("admin") {
+            dimension = "edition"
+            manifestPlaceholders["appLabel"] = "TempMail Admin"
+        }
+        create("public") {
+            dimension = "edition"
+            applicationIdSuffix = ".public"
+            manifestPlaceholders["appLabel"] = "TempMail"
+        }
+    }
+
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName(if (hasReleaseKeystore) "release" else "debug")
@@ -64,4 +83,10 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // FileProvider untuk memasang APK pembaruan (MainActivity.kt).
+    implementation("androidx.core:core:1.13.1")
 }

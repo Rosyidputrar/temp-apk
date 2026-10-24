@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Ikon notifikasi dipanggil lewat nama dari Dart (lib/notify.dart), jadi
+     resource shrinker tidak melihat pemakaiannya: jangan dibuang. -->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/ic_stat_mail" />

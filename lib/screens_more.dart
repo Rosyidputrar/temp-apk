@@ -5,8 +5,11 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 
+import 'account.dart';
 import 'api.dart';
 import 'main.dart';
+import 'screens_accounts.dart';
+import 'update.dart';
 import 'screens_main.dart' show fmtTime, parseApiTime;
 
 /// "baru saja" / "5 mnt lalu" dari waktu ISO.
@@ -46,12 +49,19 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
   void initState() {
     super.initState();
     currentTab.addListener(_onTab);
+    appState.addListener(_onActive);
     _load();
+  }
+
+  // Sorotan "aktif" harus pindah begitu alamat aktif berganti.
+  void _onActive() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
     currentTab.removeListener(_onTab);
+    appState.removeListener(_onActive);
     super.dispose();
   }
 
@@ -64,6 +74,7 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
     try {
       final r = await api.favorites();
       final list = listOf(r, ['items', 'favorites']).toList();
+      setFavoritesFrom(list);
       // Yang disematkan selalu di atas.
       list.sort((a, b) {
         final pa = a is Map && a['pinned'] == true ? 0 : 1;
@@ -83,6 +94,8 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
           _loading = false;
           _err = errorText(e);
         });
+        // Daftar lama tetap tampil; beri tahu bahwa penyegaran gagal.
+        if (_items.isNotEmpty) showError(context, e);
       }
     }
   }
@@ -241,6 +254,7 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
     if (save != true) return;
     try {
       await api.patchFavorite(addr, label: l, note: n);
+      if (mounted) showOk(context, 'Label & catatan disimpan');
       _load();
     } catch (e) {
       if (mounted) showError(context, e);
@@ -257,6 +271,9 @@ class _FavoritesScreenState extends State<FavoritesScreen> {
         await copyText(context, addr, 'Alamat disalin');
       } else if (v == 'pin') {
         await api.patchFavorite(addr, pinned: !pinned);
+        if (mounted) {
+          showOk(context, pinned ? 'Sematan dilepas' : 'Disematkan di atas');
+        }
         _load();
       } else if (v == 'edit') {
         await _edit(f);
@@ -392,10 +409,33 @@ class MoreScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final items = <(IconData, String, String, Widget)>[
+      if (kPublic) ...[
+        (
+          Icons.account_circle_outlined,
+          'Akun',
+          'Kuota harian, perangkat, ganti password, keluar',
+          const AccountScreen(),
+        ),
+        (
+          Icons.alternate_email,
+          'Alamat saya',
+          'Alamat milikmu + yang dibuka dengan password',
+          const MyMailboxesScreen(),
+        ),
+      ],
+      if (!kPublic)
+        (
+          Icons.manage_accounts_outlined,
+          'Kelola akun',
+          'Akun APK publik, kuota, perangkat, alamat terdaftar',
+          const AccountsAdminScreen(),
+        ),
       (
         Icons.call_split,
         'Varian alamat',
-        'Titik & plus dari alamat aktif',
+        kPublic
+            ? 'Varian titik dari alamat aktif'
+            : 'Titik & plus dari alamat aktif',
         const VariantsScreen(),
       ),
       (
@@ -404,16 +444,19 @@ class MoreScreen extends StatelessWidget {
         'Dari alamat @gmail.com mana pun',
         const GmailVariantsScreen(),
       ),
-      (
-        Icons.list_alt,
-        'Alias (alias.md)',
-        'Lihat, edit, validasi daftar alias',
-        const AliasScreen(),
-      ),
+      if (!kPublic)
+        (
+          Icons.list_alt,
+          'Alias (alias.md)',
+          'Lihat, edit, validasi daftar alias',
+          const AliasScreen(),
+        ),
       (
         Icons.language,
         'Domain',
-        'Cari, acak, grup, dan uji domain',
+        kPublic
+            ? 'Daftar domain yang bisa dipakai'
+            : 'Cari, acak, grup, dan uji domain',
         const DomainsScreen(),
       ),
       (
@@ -422,28 +465,38 @@ class MoreScreen extends StatelessWidget {
         'Alamat baru dipakai + feed aktivitas',
         const HistoryScreen(),
       ),
+      if (!kPublic) ...[
+        (
+          Icons.visibility_outlined,
+          'Pantauan & notifikasi',
+          'Watch OTP/link + tes notifikasi',
+          const WatchScreen(),
+        ),
+        (
+          Icons.bug_report_outlined,
+          'Debug',
+          'Diagnosis upstream per alamat',
+          const DebugScreen(),
+        ),
+        (
+          Icons.admin_panel_settings_outlined,
+          'Admin',
+          'Log, config, domain & pola OTP kustom',
+          const AdminScreen(),
+        ),
+      ],
       (
-        Icons.visibility_outlined,
-        'Pantauan & notifikasi',
-        'Watch OTP/link + tes notifikasi',
-        const WatchScreen(),
-      ),
-      (
-        Icons.bug_report_outlined,
-        'Debug',
-        'Diagnosis upstream per alamat',
-        const DebugScreen(),
-      ),
-      (
-        Icons.admin_panel_settings_outlined,
-        'Admin',
-        'Log, config, domain & pola OTP kustom',
-        const AdminScreen(),
+        Icons.system_update_outlined,
+        'Pembaruan aplikasi',
+        'Cek versi terbaru, unduh & pasang APK',
+        const UpdateScreen(),
       ),
       (
         Icons.info_outline,
         'Tentang & status',
-        'Info server /me + health',
+        kPublic
+            ? 'Versi aplikasi & status layanan'
+            : 'Info server /me + health',
         const AboutScreen(),
       ),
     ];
@@ -531,7 +584,31 @@ class _VariantsScreenState extends State<VariantsScreen> {
   }
 
   /// Varian titik: inbox-nya sama dengan alamat varian → langsung pakai.
+  /// APK publik: alamat varian didaftarkan dulu ke akun (memakai jatah
+  /// harian); password-nya disamakan dengan alamat dasar bila kita pemiliknya.
   Future<void> _useDot(String address) async {
+    if (kPublic) {
+      final base = appState.activeRef;
+      final i = address.lastIndexOf('@');
+      try {
+        String? pw;
+        if (base != null) {
+          try {
+            pw = (await api.mailboxPassword(base))['password']?.toString();
+          } catch (_) {}
+        }
+        final r = await api.createMailbox(
+          alias: address.substring(0, i),
+          domain: address.substring(i + 1),
+          password: pw,
+        );
+        if (r is Map) authState.applyQuota(r['quota']);
+      } on ApiException catch (e) {
+        if (!mounted) return;
+        // Dipakai akun lain → tawarkan password; selain itu tampilkan galatnya.
+        if (!await resolveAccessError(context, e, address: address)) return;
+      }
+    }
     await appState.setActive(address, address);
     if (mounted) await copyText(context, address, 'Aktif & disalin: $address');
   }
@@ -667,18 +744,27 @@ class _VariantsScreenState extends State<VariantsScreen> {
             style: const TextStyle(fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 10),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'dot', label: Text('Titik')),
-              ButtonSegment(value: 'plus', label: Text('Plus')),
-              ButtonSegment(value: 'both', label: Text('Keduanya')),
-            ],
-            selected: {_mode},
-            onSelectionChanged: (v) {
-              setState(() => _mode = v.first);
-              _load();
-            },
-          ),
+          if (kPublic)
+            Text(
+              'Varian titik = alamat terpisah dengan inbox sendiri. '
+              '"Pakai" mendaftarkannya ke akunmu (memakai jatah harian).',
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            )
+          else
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'dot', label: Text('Titik')),
+                ButtonSegment(value: 'plus', label: Text('Plus')),
+                ButtonSegment(value: 'both', label: Text('Keduanya')),
+              ],
+              selected: {_mode},
+              onSelectionChanged: (v) {
+                setState(() => _mode = v.first);
+                _load();
+              },
+            ),
           if (_mode != 'dot') ...[
             const SizedBox(height: 10),
             TextField(
@@ -840,18 +926,20 @@ class _GmailVariantsScreenState extends State<GmailVariantsScreen> {
             ),
           ),
           const SizedBox(height: 10),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'dot', label: Text('Titik')),
-              ButtonSegment(value: 'plus', label: Text('Plus')),
-              ButtonSegment(value: 'both', label: Text('Keduanya')),
-            ],
-            selected: {_mode},
-            onSelectionChanged: (v) {
-              setState(() => _mode = v.first);
-              if (_items.isNotEmpty) _load();
-            },
-          ),
+          // APK publik: hanya varian titik (varian plus memakai alias.md admin).
+          if (!kPublic)
+            SegmentedButton<String>(
+              segments: const [
+                ButtonSegment(value: 'dot', label: Text('Titik')),
+                ButtonSegment(value: 'plus', label: Text('Plus')),
+                ButtonSegment(value: 'both', label: Text('Keduanya')),
+              ],
+              selected: {_mode},
+              onSelectionChanged: (v) {
+                setState(() => _mode = v.first);
+                if (_items.isNotEmpty) _load();
+              },
+            ),
           if (_mode == 'dot')
             SwitchListTile(
               contentPadding: EdgeInsets.zero,
@@ -925,6 +1013,10 @@ class _AliasScreenState extends State<AliasScreen> {
   bool _loading = true;
   bool _dirty = false;
   bool _saving = false;
+  // Belum pernah berhasil dimuat → jangan izinkan simpan (bisa menimpa
+  // alias.md di server dengan isi kosong).
+  bool _loaded = false;
+  String? _loadError;
   Map? _summary;
   List<dynamic> _issues = [];
 
@@ -962,11 +1054,16 @@ class _AliasScreenState extends State<AliasScreen> {
           _issues = [];
           _summary = null;
           _loading = false;
+          _loaded = true;
+          _loadError = null;
         });
       }
     } catch (e) {
       if (mounted) {
-        setState(() => _loading = false);
+        setState(() {
+          _loading = false;
+          _loadError = errorText(e);
+        });
         showError(context, e);
       }
     }
@@ -1197,6 +1294,31 @@ class _AliasScreenState extends State<AliasScreen> {
                       ),
                     const SizedBox(height: 12),
                   ],
+                  if (!_loaded && _loadError != null) ...[
+                    Card(
+                      color: s.errorContainer,
+                      child: ListTile(
+                        leading: Icon(
+                          Icons.cloud_off,
+                          color: s.onErrorContainer,
+                        ),
+                        title: Text(
+                          'alias.md gagal dimuat',
+                          style: TextStyle(color: s.onErrorContainer),
+                        ),
+                        subtitle: Text(
+                          '$_loadError\nSimpan dinonaktifkan agar alias di server tidak tertimpa.',
+                          style: TextStyle(color: s.onErrorContainer),
+                        ),
+                        trailing: IconButton(
+                          tooltip: 'Coba lagi',
+                          icon: Icon(Icons.refresh, color: s.onErrorContainer),
+                          onPressed: _load,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                  ],
                   _heading('Isi alias.md${_dirty ? ' (belum disimpan)' : ''}'),
                   TextField(
                     controller: _ctl,
@@ -1220,14 +1342,14 @@ class _AliasScreenState extends State<AliasScreen> {
                     children: [
                       Expanded(
                         child: OutlinedButton(
-                          onPressed: _validate,
+                          onPressed: _loaded ? _validate : null,
                           child: const Text('Validasi'),
                         ),
                       ),
                       const SizedBox(width: 10),
                       Expanded(
                         child: FilledButton(
-                          onPressed: _saving ? null : _save,
+                          onPressed: _saving || !_loaded ? null : _save,
                           child: Text(_saving ? 'Menyimpan…' : 'Simpan'),
                         ),
                       ),
@@ -1471,6 +1593,7 @@ class _DomainsScreenState extends State<DomainsScreen> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 IconButton(
+                  tooltip: 'Halaman sebelumnya',
                   onPressed: _page <= 1 || _busy
                       ? null
                       : () => _search(page: _page - 1),
@@ -1478,6 +1601,7 @@ class _DomainsScreenState extends State<DomainsScreen> {
                 ),
                 Text('Hal $_page / $pages'),
                 IconButton(
+                  tooltip: 'Halaman berikutnya',
                   onPressed: _page >= pages || _busy
                       ? null
                       : () => _search(page: _page + 1),
@@ -1509,11 +1633,17 @@ class _HistoryScreenState extends State<HistoryScreen>
   @override
   void initState() {
     super.initState();
+    appState.addListener(_onActive);
     _load();
+  }
+
+  void _onActive() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    appState.removeListener(_onActive);
     _tabs.dispose();
     super.dispose();
   }
@@ -1553,8 +1683,15 @@ class _HistoryScreenState extends State<HistoryScreen>
   }
 
   Future<void> _deleteOne(String addr) async {
+    final ok = await confirmDialog(
+      context,
+      title: 'Hapus dari riwayat?',
+      body: '$addr hilang dari daftar "Baru dipakai" (inbox tidak terhapus).',
+    );
+    if (!ok) return;
     try {
       await api.deleteRecent(addr);
+      if (mounted) showOk(context, 'Dihapus dari riwayat');
       _load();
     } catch (e) {
       if (mounted) showError(context, e);
@@ -1825,8 +1962,16 @@ class _WatchScreenState extends State<WatchScreen> {
   Future<void> _delete(Map w) async {
     final id = w['id']?.toString();
     if (id == null) return;
+    final ok = await confirmDialog(
+      context,
+      title: 'Hapus pantauan?',
+      body:
+          'Pantauan untuk ${w['address'] ?? w['ref'] ?? id} dihentikan dan tidak mengirim notifikasi lagi.',
+    );
+    if (!ok) return;
     try {
       await api.watchDelete(id);
+      if (mounted) showOk(context, 'Pantauan dihapus');
       _load();
     } catch (e) {
       if (mounted) showError(context, e);
@@ -2357,11 +2502,14 @@ class _AboutScreenState extends State<AboutScreen> {
     } catch (e) {
       if (mounted) setState(() => _healthErr = errorText(e));
     }
-    try {
-      final m = await api.me();
-      if (mounted) setState(() => _me = m);
-    } catch (e) {
-      if (mounted) showError(context, e);
+    // Info server mentah hanya ditampilkan di APK admin.
+    if (!kPublic) {
+      try {
+        final m = await api.me();
+        if (mounted) setState(() => _me = m);
+      } catch (e) {
+        if (mounted) showError(context, e);
+      }
     }
     if (mounted) setState(() => _loading = false);
   }
@@ -2412,37 +2560,67 @@ class _AboutScreenState extends State<AboutScreen> {
                   ),
                   subtitle: Text(
                     _healthErr ??
-                        (up != null
+                        (kPublic
+                            ? (h is Map && h['status'] == 'degraded'
+                                  ? 'Layanan email sedang terganggu, coba lagi nanti'
+                                  : 'Layanan email berjalan normal')
+                            : up != null
                             ? 'Upstream ${up['ok'] == true ? 'OK' : 'GAGAL'}'
                                   '${up['ms'] != null ? ' · ${up['ms']} ms' : ''}'
                                   '${h is Map && h.containsKey('kv') ? ' · KV ${h['kv'] == true || h['kv'] is Map ? 'OK' : 'GAGAL'}' : ''}'
                             : kApiBase),
                   ),
                 ),
+                if (kPublic)
+                  ListTile(
+                    leading: const Icon(Icons.account_circle_outlined),
+                    title: Text('Masuk sebagai ${authState.username ?? '-'}'),
+                    subtitle: Text(expiryText(authState.user?['expires_at'])),
+                  )
+                else
+                  ListTile(
+                    leading: Icon(
+                      kApiToken.isEmpty ? Icons.key_off_outlined : Icons.key,
+                      color: kApiToken.isEmpty ? s.error : null,
+                    ),
+                    title: Text(
+                      kApiToken.isEmpty
+                          ? 'Token API belum disuntik'
+                          : 'Token API terpasang',
+                    ),
+                    subtitle: const Text(
+                      'Disuntik saat build via --dart-define',
+                    ),
+                  ),
                 ListTile(
-                  leading: Icon(
-                    kApiToken.isEmpty ? Icons.key_off_outlined : Icons.key,
-                    color: kApiToken.isEmpty ? s.error : null,
-                  ),
+                  leading: const Icon(Icons.system_update_outlined),
                   title: Text(
-                    kApiToken.isEmpty
-                        ? 'Token API belum disuntik'
-                        : 'Token API terpasang',
+                    kAppBuild > 0
+                        ? 'Versi aplikasi: b$kAppBuild'
+                        : 'Versi aplikasi: build lokal',
                   ),
-                  subtitle: const Text('Disuntik saat build via --dart-define'),
+                  subtitle: const Text('Ketuk untuk cek pembaruan'),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (_) => const UpdateScreen()),
+                  ),
                 ),
               ],
             ),
           ),
-          const SizedBox(height: 12),
-          _heading('Server'),
-          SelectableText(kApiBase),
-          const SizedBox(height: 12),
-          _heading('Health'),
-          if (h != null) JsonView(h),
-          const SizedBox(height: 12),
-          _heading('Info server (/v1/me)'),
-          if (_me != null) JsonView(_me),
+          // Detail teknis server hanya untuk APK admin.
+          if (!kPublic) ...[
+            const SizedBox(height: 12),
+            _heading('Server'),
+            SelectableText(kApiBase),
+            const SizedBox(height: 12),
+            _heading('Health'),
+            if (h != null) JsonView(h),
+            const SizedBox(height: 12),
+            _heading('Info server (/v1/me)'),
+            if (_me != null) JsonView(_me),
+          ],
         ],
       ),
     );

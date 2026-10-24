@@ -5,12 +5,17 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:path_provider/path_provider.dart';
 
+import 'account.dart';
 import 'api.dart';
 import 'screens_main.dart';
 import 'screens_otp.dart';
+import 'notify.dart';
 import 'screens_more.dart';
+import 'home_widgets.dart';
+import 'update.dart';
 
 final api = TempmailApi();
 
@@ -25,7 +30,11 @@ class AppState extends ChangeNotifier {
     return File('${dir.path}/tempmail_state.json');
   }
 
+  /// Baca ulang file state. Hanya memberi tahu pendengar bila isinya
+  /// berubah (dipanggil juga saat aplikasi kembali ke depan, karena widget
+  /// "Buat cepat" bisa mengganti alamat aktif saat aplikasi ditutup).
   Future<void> load() async {
+    final before = (activeRef, activeAddress);
     try {
       final f = await _stateFile();
       if (await f.exists()) {
@@ -34,7 +43,7 @@ class AppState extends ChangeNotifier {
         activeAddress = m['address'] as String?;
       }
     } catch (_) {}
-    notifyListeners();
+    if ((activeRef, activeAddress) != before) notifyListeners();
   }
 
   Future<void> _save() async {
@@ -57,6 +66,10 @@ class AppState extends ChangeNotifier {
     await _save();
   }
 
+  /// Alamat aktif sama, tapi aksesnya baru berubah (mis. baru dibuka dengan
+  /// password) → layar yang mendengarkan memuat ulang.
+  void touch() => notifyListeners();
+
   Future<void> clearActive() async {
     activeRef = null;
     activeAddress = null;
@@ -67,10 +80,79 @@ class AppState extends ChangeNotifier {
 
 final appState = AppState();
 
+/// Untuk membuka layar dari luar widget tree (mis. dari tombol notifikasi).
+final navigatorKey = GlobalKey<NavigatorState>();
+
+/// Ketukan notifikasi yang butuh UI: salin OTP / buka layar pembaruan.
+void _onNotificationAction(String action, String payload) {
+  Map p = const {};
+  try {
+    p = jsonDecode(payload) as Map;
+  } catch (_) {}
+  switch (p['t']) {
+    case 'otp':
+      final code = p['code']?.toString();
+      if (code != null && code.isNotEmpty) {
+        Clipboard.setData(ClipboardData(text: code));
+      }
+      navigatorKey.currentState?.popUntil((r) => r.isFirst);
+      currentTab.value = kTabOtp;
+    case 'link':
+      final url = p['url']?.toString();
+      if (url != null && url.isNotEmpty) {
+        Clipboard.setData(ClipboardData(text: url));
+        if (action == 'link_open') openExternalUrl(url);
+      }
+      navigatorKey.currentState?.popUntil((r) => r.isFirst);
+      currentTab.value = kTabOtp;
+    case 'wait':
+      if (action.isEmpty) {
+        navigatorKey.currentState?.popUntil((r) => r.isFirst);
+        currentTab.value = kTabOtp;
+      }
+    case 'update':
+      if (action.isEmpty || action == 'upd_install') {
+        openUpdateScreen(autoInstall: action == 'upd_install');
+      }
+  }
+}
+
 /// Tab bawah yang sedang tampil. Layar di dalam IndexedStack tetap hidup
 /// walau tidak terlihat, jadi mereka memakai ini untuk tahu kapan perlu
 /// memuat ulang (Favorit) atau menghentikan auto-refresh (Inbox).
 final currentTab = ValueNotifier<int>(0);
+
+/// Perintah ke tab OTP dari luar (mis. tombol "Tunggu OTP" di widget).
+final otpCommand = ValueNotifier<String?>(null);
+
+/// Alamat favorit (huruf kecil), dibagi Beranda & tab Favorit supaya tombol
+/// Favorit di Beranda selalu sesuai dengan daftar favorit.
+final favoriteAddresses = ValueNotifier<Set<String>>(<String>{});
+
+String _normAddr(String a) => a.trim().toLowerCase();
+
+bool isFavorite(String? address) =>
+    address != null && favoriteAddresses.value.contains(_normAddr(address));
+
+void setFavoritesFrom(List<dynamic> items) {
+  favoriteAddresses.value = {
+    for (final f in items)
+      if (f is Map && '${f['address'] ?? ''}'.trim().isNotEmpty)
+        _normAddr('${f['address']}'),
+  };
+}
+
+void markFavorite(String address, bool on) {
+  final s = {...favoriteAddresses.value};
+  on ? s.add(_normAddr(address)) : s.remove(_normAddr(address));
+  favoriteAddresses.value = s;
+}
+
+Future<void> refreshFavorites() async {
+  try {
+    setFavoritesFrom(listOf(await api.favorites(), ['items', 'favorites']));
+  } catch (_) {}
+}
 
 const int kTabHome = 0;
 const int kTabInbox = 1;
@@ -81,6 +163,11 @@ void main() {
   WidgetsFlutterBinding.ensureInitialized();
   // JANGAN await apa pun sebelum runApp: frame pertama harus digambar dulu.
   // (Await SharedPreferences di sini pernah bikin layar hitam permanen.)
+  if (kPublic) {
+    // Sesi tersimpan; juga memasang penangan "sesi dicabut server".
+    // ignore: unawaited_futures
+    authState.load().catchError((_) {});
+  }
   // ignore: unawaited_futures
   appState
       .load()
@@ -109,6 +196,46 @@ void main() {
     );
   };
   runApp(const TempMailApp());
+  // Setelah frame pertama: notifikasi & cek pembaruan (tidak memblokir UI).
+  Notifier.instance.addListener(_onNotificationAction);
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    if (await _flavorMismatch()) return;
+    await Notifier.instance.init();
+    await UpdateService.instance.init();
+    await HomeWidgets.init();
+  });
+}
+
+/// Penjaga salah build: --flavor public wajib bersama PUBLIC_BUILD=true (dan
+/// sebaliknya). Kalau tidak, APK ".public" bisa berperilaku seperti APK admin.
+Future<bool> _flavorMismatch() async {
+  if (!Platform.isAndroid) return false;
+  try {
+    final info = await _appChannel.invokeMapMethod<String, dynamic>('info');
+    final pkg = '${info?['package'] ?? ''}';
+    if (pkg.isEmpty || pkg.endsWith('.public') == kPublic) return false;
+  } catch (_) {
+    return false;
+  }
+  runApp(
+    const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        body: Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'Build APK tidak valid: flavor dan PUBLIC_BUILD tidak cocok. '
+              'Build ulang dengan --flavor public --dart-define=PUBLIC_BUILD=true '
+              '(atau --flavor admin tanpa PUBLIC_BUILD).',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+  return true;
 }
 
 class TempMailApp extends StatelessWidget {
@@ -180,11 +307,17 @@ class TempMailApp extends StatelessWidget {
     );
     return MaterialApp(
       title: 'TempMail',
+      navigatorKey: navigatorKey,
+      // Teks bawaan Material (tooltip Kembali, menu Salin/Tempel, dll.)
+      // dalam bahasa Indonesia.
+      locale: const Locale('id'),
+      supportedLocales: const [Locale('id'), Locale('en')],
+      localizationsDelegates: GlobalMaterialLocalizations.delegates,
       debugShowCheckedModeBanner: false,
       theme: theme(scheme),
       darkTheme: theme(darkScheme),
       themeMode: ThemeMode.system,
-      home: const Shell(),
+      home: const AuthGate(child: Shell()),
     );
   }
 }
@@ -195,7 +328,7 @@ class Shell extends StatefulWidget {
   State<Shell> createState() => _ShellState();
 }
 
-class _ShellState extends State<Shell> {
+class _ShellState extends State<Shell> with WidgetsBindingObserver {
   static const _pages = [
     HomeScreen(),
     InboxScreen(),
@@ -208,12 +341,22 @@ class _ShellState extends State<Shell> {
   void initState() {
     super.initState();
     currentTab.addListener(_onTab);
+    WidgetsBinding.instance.addObserver(this);
+    // APK publik: kuota & masa aktif terbaru (sekaligus memeriksa sesi).
+    if (kPublic) authState.refresh().catchError((_) => null);
   }
 
   @override
   void dispose() {
     currentTab.removeListener(_onTab);
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
+  }
+
+  // Kembali ke aplikasi → alamat aktif mungkin diganti widget "Buat cepat".
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) appState.load();
   }
 
   void _onTab() {
@@ -278,12 +421,29 @@ String errorText(Object e) {
 
 void showError(BuildContext context, Object e) {
   final s = Theme.of(context).colorScheme;
+  // Alamat milik akun lain → langsung tawarkan membuka dengan password.
+  final needsPassword =
+      e is ApiException &&
+      (e.code == 'MAILBOX_PASSWORD_REQUIRED' ||
+          (e.code == 'ADDRESS_TAKEN' &&
+              e.details is Map &&
+              (e.details as Map)['needs_password'] == true));
   ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
     ..showSnackBar(
       SnackBar(
         content: Text(errorText(e), style: TextStyle(color: s.onError)),
         backgroundColor: s.error,
+        action: needsPassword
+            ? SnackBarAction(
+                label: 'Buka',
+                textColor: s.onError,
+                onPressed: () {
+                  final ctx = navigatorKey.currentContext;
+                  if (ctx != null) resolveAccessError(ctx, e);
+                },
+              )
+            : null,
       ),
     );
 }
@@ -292,6 +452,20 @@ void showOk(BuildContext context, String msg) {
   ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
     ..showSnackBar(SnackBar(content: Text(msg)));
+}
+
+const _appChannel = MethodChannel('tempmail/app');
+
+/// Buka link (http/https) di browser HP — bukan di dalam aplikasi.
+Future<bool> openExternalUrl(String url) async {
+  final u = Uri.tryParse(url);
+  if (u == null || !(u.scheme == 'http' || u.scheme == 'https')) return false;
+  try {
+    return await _appChannel.invokeMethod<bool>('openUrl', {'url': url}) ??
+        false;
+  } catch (_) {
+    return false;
+  }
 }
 
 /// Salin ke clipboard + beri tahu pengguna.
