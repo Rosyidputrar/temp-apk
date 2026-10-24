@@ -81,7 +81,7 @@ jobs:
       # APK publik: TANPA token admin; pengguna login dengan akun dari admin.
       - name: Build APK publik
         env:
-          UPDATE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || github.repository }}
+          UPDATE_REPO: ${{ vars.PUBLIC_RELEASE_REPO || 'seseegy/temp-p' }}
         run: |
           flutter build apk --release --split-per-abi --flavor public \
             --dart-define=PUBLIC_BUILD=true \
@@ -143,13 +143,27 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !github.event.repository.private
         run: echo "::warning::Repo ini publik — APK admin TIDAK dirilis (berisi token admin). Ambil dari artifact tempmail-admin-${{ github.run_number }}."
 
-      # Release APK publik ke repo rilis publik (vars.PUBLIC_RELEASE_REPO), token
-      # secrets.PUBLIC_RELEASE_TOKEN = fine-grained PAT dengan izin Contents: write di repo itu.
+      # Release APK publik ke repo rilis publik (default seseegy/temp-p, bisa diganti lewat
+      # vars.PUBLIC_RELEASE_REPO). Butuh secrets.PUBLIC_RELEASE_TOKEN = fine-grained PAT
+      # dengan izin Contents: Read and write di repo rilis itu.
+      - name: Cek token rilis publik
+        id: pubrel
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::Secret PUBLIC_RELEASE_TOKEN belum ada — APK publik hanya tersedia sebagai artifact."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Terbitkan release publik
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.PUBLIC_RELEASE_REPO != ''
+        if: steps.pubrel.outputs.ok == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          repository: ${{ vars.PUBLIC_RELEASE_REPO }}
+          repository: ${{ vars.PUBLIC_RELEASE_REPO || 'seseegy/temp-p' }}
           token: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
           tag_name: b${{ github.run_number }}
           name: TempMail build ${{ github.run_number }}
