@@ -8,3 +8,8 @@ android/local.properties
 android/app/src/main/java/io/flutter/plugins/GeneratedPluginRegistrant.java
 android/.gradle/
 android/tempmail-release.keystore
+
+# Dibuat ulang oleh Flutter saat build (tidak perlu di-commit)
+/android/gradlew
+/android/gradlew.bat
+/android/gradle/wrapper/gradle-wrapper.jar
